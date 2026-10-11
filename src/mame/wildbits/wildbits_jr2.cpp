@@ -341,6 +341,8 @@ private:
 	void io_wait_read();
 	void io_wait_write();
 	bool m_is_turbo;
+	uint8_t m_ram_write_frac;
+	uint8_t m_io_read_frac;
 	uint8_t m_io_write_frac;
 	uint8_t *m_slot_w_ptr[8];
 
@@ -362,16 +364,14 @@ private:
 	memory_bank_array_creator<8> m_bank_r;
 
 	// Memory structures
-	std::unique_ptr<uint8_t[]> m_ram;        // 2MB Physical SRAM (1,792 KB decoded)
+	std::unique_ptr<uint8_t[]> m_ram;        // 2MB Physical SRAM (2,016 KB contiguous for Blocks $00-$FB)
 	std::unique_ptr<uint8_t[]> m_cart;       // 256KB Cartridge port decode ($80 - $9F)
 	std::unique_ptr<uint8_t[]> m_unmapped;   // 8KB dummy unmapped page
-	std::unique_ptr<uint8_t[]> m_vram_c0;     // Block $C0: VICKY control & gamma
-	std::unique_ptr<uint8_t[]> m_vram_c1;     // Block $C1: Font RAM & Palettes
-	std::unique_ptr<uint8_t[]> m_vram_c2;     // Block $C2: Text Character Matrix
-	std::unique_ptr<uint8_t[]> m_vram_c3;     // Block $C3: Text Color Matrix
-	std::unique_ptr<uint8_t[]> m_vram_c4;     // Block $C4: Audio registers
-	std::unique_ptr<uint8_t[]> m_vram_c5;     // Block $C5: MemText FG/BG CLUTs
-	std::unique_ptr<uint8_t[]> m_vram_c6;     // Block $C6: MemText Font BRAM
+	std::unique_ptr<uint8_t[]> m_vram_fc;    // Block $FC: VICKY control, Gamma, LineDraw, Tilemaps, MemText regs, Sprites, Text CLUTs
+	std::unique_ptr<uint8_t[]> m_vram_fd;    // Block $FD: Font RAM ($0000-$0FFF) & Graphics CLUTs ($1000-$1FFF)
+	std::unique_ptr<uint8_t[]> m_vram_fe;    // Block $FE: Text Character Matrix (4,800 bytes)
+	std::unique_ptr<uint8_t[]> m_vram_ff;    // Block $FF: Text Color Matrix (4,800 bytes)
+	std::unique_ptr<uint8_t[]> m_memtext_clut; // 4KB MemText FG/BG CLUTs
 	uint8_t m_constant_ram[256];
 	uint8_t m_vector_ram[16];
 
@@ -453,6 +453,7 @@ private:
 
 	// SAM2695 MIDI state
 	uint8_t m_sam2695_ctrl;
+	std::queue<uint8_t> m_sam2695_rx_fifo;
 	std::unique_ptr<osd::midi_output_port> m_midi_out;
 
 	// VS1053b Audio Decoder state ($FF50 - $FF5F)
@@ -506,6 +507,8 @@ private:
 	// WizFi360 State
 	std::queue<uint8_t> m_wizfi_rx_fifo;
 	std::string m_wizfi_tx_buf;
+	uint8_t m_wizfi_baud_code;
+	uint8_t m_wizfi_reset_reg;
 	uint8_t m_wizfi_ctrl;
 	bool m_wizfi_transparent;
 	int m_wizfi_plus_count;
@@ -593,71 +596,46 @@ constexpr uint8_t WBJR2_MACHINE_ID = 0x1a;
 uint8_t *wildbits_jr2_state::get_physical_block_ptr(uint8_t block_num)
 {
 	// 21-bit physical space: 8KB per block (256 blocks, 2MB total space)
-	// Blocks 0x00 - 0x3F (0x000000 - 0x07FFFF): Base System SRAM (512KB)
-	// Blocks 0x40 - 0x7F (0x080000 - 0x0FFFFF): Flash ROM (512KB) or SRAM if FLASHDIS=1
-	// Blocks 0x80 - 0x9F (0x100000 - 0x13FFFF): Cartridge Port (/c0, /c1, 256KB) or SRAM if FLASHDIS=1
-	// Blocks 0xA0 - 0xBF (0x140000 - 0x17FFFF): Window A Expansion SRAM (256KB)
-	// Blocks 0xC0 - 0xC6 (0x180000 - 0x18DFFF): Dedicated Video, Audio & MemText BRAM buffers (56KB)
-	// Blocks 0xC7 - 0xCF: Unmapped (72KB)
-	// Blocks 0xD0 - 0xEF (0x1A0000 - 0x1DFFFF): Window B Expansion SRAM (256KB)
-	// Blocks 0xF0 - 0xFF: Unmapped (128KB)
-	if (block_num < 0x40)
-	{
-		return &m_ram[block_num * 0x2000];
-	}
-	else if (block_num < 0x80)
+	// Blocks $00 - $FB: Contiguous Physical SRAM (252 blocks = 2,016 KB)
+	// Blocks $40 - $7F: Flash ROM (512KB) when FLASHDIS=0; Physical SRAM when FLASHDIS=1
+	// Blocks $80 - $9F: Cartridge Port (256KB) when FLASHDIS=0; Physical SRAM when FLASHDIS=1
+	// Blocks $FC - $FF: Sectored I/O Pages:
+	//   $FC: VICKY_BLK (registers, line draw, tilemaps, MemText regs, Sprites, Text CLUTs)
+	//   $FD: FONT_BLK (dual font banks $0000-$0FFF, graphics CLUTs $1000-$1FFF)
+	//   $FE: TEXT_RAM_BLK (Text Character Matrix, 4,800 bytes)
+	//   $FF: COLOR_RAM_BLK (Text Color Matrix, 4,800 bytes)
+	if (block_num < 0xfc)
 	{
 		if (m_mmu_io_ctrl & 0x04)
+		{
+			// Max-RAM FLASHDIS mode: 2,016 KB contiguous physical SRAM
 			return &m_ram[block_num * 0x2000];
+		}
 		else
-			return &m_flash[(block_num - 0x40) * 0x2000];
+		{
+			if (block_num >= 0x40 && block_num < 0x80)
+				return &m_flash[(block_num - 0x40) * 0x2000];
+			else if (block_num >= 0x80 && block_num < 0xa0)
+				return &m_cart[(block_num - 0x80) * 0x2000];
+			else
+				return &m_ram[block_num * 0x2000];
+		}
 	}
-	else if (block_num >= 0x80 && block_num < 0xa0)
+	else if (block_num == 0xfc)
 	{
-		if (m_mmu_io_ctrl & 0x04)
-			return &m_ram[block_num * 0x2000];
-		else
-			return &m_cart[(block_num - 0x80) * 0x2000];
+		return m_vram_fc.get();
 	}
-	else if (block_num >= 0xa0 && block_num < 0xc0)
+	else if (block_num == 0xfd)
 	{
-		return &m_ram[block_num * 0x2000];
+		return m_vram_fd.get();
 	}
-	else if (block_num == 0xc0)
+	else if (block_num == 0xfe)
 	{
-		return m_vram_c0.get();
+		return m_vram_fe.get();
 	}
-	else if (block_num == 0xc1)
+	else // 0xff
 	{
-		return m_vram_c1.get();
-	}
-	else if (block_num == 0xc2)
-	{
-		return m_vram_c2.get();
-	}
-	else if (block_num == 0xc3)
-	{
-		return m_vram_c3.get();
-	}
-	else if (block_num == 0xc4)
-	{
-		return m_vram_c4.get();
-	}
-	else if (block_num == 0xc5)
-	{
-		return m_vram_c5.get();
-	}
-	else if (block_num == 0xc6)
-	{
-		return m_vram_c6.get();
-	}
-	else if (block_num >= 0xd0 && block_num < 0xf0)
-	{
-		return &m_ram[block_num * 0x2000];
-	}
-	else
-	{
-		return m_unmapped.get();
+		return m_vram_ff.get();
 	}
 }
 
@@ -668,9 +646,10 @@ void wildbits_jr2_state::update_banks()
 	{
 		uint8_t block = m_mlut[active_lut][slot];
 		m_bank_r[slot]->set_base(get_physical_block_ptr(block));
-		if (block >= 0x40 && block < 0x80 && !(m_mmu_io_ctrl & 0x04))
+		if ((block >= 0x40 && block < 0x80 && !(m_mmu_io_ctrl & 0x04)) ||
+		    (block >= 0x80 && block < 0xa0 && !(m_mmu_io_ctrl & 0x04)))
 		{
-			// Flash ROM is read-only when FLASHDIS=0; discard CPU writes
+			// Flash ROM and Cartridge ROM are read-only when FLASHDIS=0; discard CPU writes
 			m_slot_w_ptr[slot] = m_unmapped.get();
 		}
 		else
@@ -682,36 +661,74 @@ void wildbits_jr2_state::update_banks()
 
 void wildbits_jr2_state::ram_w(offs_t offset, uint8_t data)
 {
-	io_wait_write();
+	if (m_is_turbo)
+	{
+		// LONGVIEW_MEMFAST Turbo Mode: Base clock = 20.0 MHz (50 ns).
+		// RAM writes complete in 14 master ticks (70 ns) = 14.28 MHz.
+		// Factor = 70 / 50 = 1.4 cycles (eat 2 wait cycles across 5 writes).
+		m_ram_write_frac = (m_ram_write_frac + 2) % 5;
+		if (m_ram_write_frac < 2)
+			m_maincpu->eat_cycles(1);
+	}
+	else
+	{
+		// LONGVIEW_MEMFAST Stock Mode: Base clock = 16.67 MHz (60 ns).
+		// RAM writes complete in 16 master ticks (80 ns) = 12.50 MHz.
+		// Factor = 80 / 60 = 1.333 cycles (eat 1 wait cycle every 3 writes).
+		m_ram_write_frac = (m_ram_write_frac + 1) % 3;
+		if (m_ram_write_frac == 0)
+			m_maincpu->eat_cycles(1);
+	}
 	m_slot_w_ptr[offset >> 13][offset & 0x1fff] = data;
 }
 
 void wildbits_jr2_state::slot7_ram_w(offs_t offset, uint8_t data)
 {
-	io_wait_write();
+	if (m_is_turbo)
+	{
+		m_ram_write_frac = (m_ram_write_frac + 2) % 5;
+		if (m_ram_write_frac < 2)
+			m_maincpu->eat_cycles(1);
+	}
+	else
+	{
+		m_ram_write_frac = (m_ram_write_frac + 1) % 3;
+		if (m_ram_write_frac == 0)
+			m_maincpu->eat_cycles(1);
+	}
 	m_slot_w_ptr[7][offset] = data;
 }
 
 void wildbits_jr2_state::io_wait_read()
 {
-	if (!m_is_turbo)
-		return;
-
-	// 32-tick peripheral read frame (160 ns = 2.0 cycles at 12.58 MHz).
-	// Stretches 16-tick (80 ns) base CPU read cycle by 1 wait cycle (+80 ns = 160 ns = 6.29 MHz).
-	m_maincpu->eat_cycles(1);
+	if (m_is_turbo)
+	{
+		// LONGVIEW_MEMFAST: 32 master ticks (160 ns = 6.25 MHz) on 20 MHz (50 ns) base clock:
+		// 160 ns / 50 ns = 3.2 cycles (eat 2 or 3 cycles, average 2.2 wait cycles).
+		m_io_read_frac = (m_io_read_frac + 1) % 5;
+		m_maincpu->eat_cycles(m_io_read_frac == 0 ? 3 : 2);
+	}
+	else
+	{
+		// 32 master ticks (160 ns) on 16.67 MHz (60 ns) base clock:
+		// 160 ns / 60 ns = 2.667 cycles (eat 1 or 2 cycles, average 1.67 wait cycles).
+		m_io_read_frac = (m_io_read_frac + 2) % 3;
+		m_maincpu->eat_cycles(m_io_read_frac == 0 ? 2 : 1);
+	}
 }
 
 void wildbits_jr2_state::io_wait_write()
 {
-	if (!m_is_turbo)
-		return;
-
-	// TURBO_FASTIOWRITE / TURBO_FASTWRITE: 24-tick fast write frame (120 ns = 1.5 cycles at 12.58 MHz).
-	// Alternates 1 and 0 wait cycles (+40 ns average = 120 ns = 8.39 MHz).
-	m_io_write_frac ^= 1;
-	if (m_io_write_frac)
-		m_maincpu->eat_cycles(1);
+	if (m_is_turbo)
+	{
+		m_io_write_frac = (m_io_write_frac + 1) % 5;
+		m_maincpu->eat_cycles(m_io_write_frac == 0 ? 3 : 2);
+	}
+	else
+	{
+		m_io_write_frac = (m_io_write_frac + 2) % 3;
+		m_maincpu->eat_cycles(m_io_write_frac == 0 ? 2 : 1);
+	}
 }
 
 uint8_t wildbits_jr2_state::mmu_mem_ctrl_r()
@@ -1049,15 +1066,15 @@ uint8_t wildbits_jr2_state::dipsw_r()
 	io_wait_read();
 	uint8_t val = m_dipsw->read();
 	// Command-line -bios option:
-	//   "-bios turbo" (default): Bit 0 = 0 (Active-low switch ON / 12 MHz Turbo Mode enabled)
-	//   "-bios stock":           Bit 0 = 1 (Active-low switch OFF / Stock 6.29 MHz clock, Turbo disabled)
+	//   "-bios turbo" (default): Bit 0 = 0 (Active-low switch ON / 20 MHz Turbo Mode enabled)
+	//   "-bios stock":           Bit 0 = 1 (Active-low switch OFF / Stock 16.67 MHz clock, Turbo disabled)
 	if (system_bios() == 2)
 	{
-		val |= 0x01; // Bit 0 = 1 (Stock 6.29 MHz)
+		val |= 0x01; // Bit 0 = 1 (Stock 16.67 MHz)
 	}
 	else if (system_bios() == 1)
 	{
-		val &= ~0x01; // Bit 0 = 0 (12 MHz Turbo Mode)
+		val &= ~0x01; // Bit 0 = 0 (20 MHz Turbo Mode)
 	}
 	return val;
 }
@@ -1515,6 +1532,8 @@ void wildbits_jr2_state::reset_wizfi()
 	while (!m_wizfi_rx_fifo.empty())
 		m_wizfi_rx_fifo.pop();
 	m_wizfi_tx_buf.clear();
+	m_wizfi_baud_code = 0x0a; // Baud code 10 = 115,200
+	m_wizfi_reset_reg = 0x00;
 	m_wizfi_ctrl = 0;
 	m_wizfi_transparent = false;
 	m_wizfi_plus_count = 0;
@@ -1997,12 +2016,23 @@ uint8_t wildbits_jr2_state::wizfi_r(offs_t offset)
 	switch (offset)
 	{
 	case 0x00: {
-		uint8_t ctrl = m_wizfi_ctrl & 0x03;
-		if (m_wizfi_tx_buf.empty() && m_wizfi_cipsend_remaining == 0) ctrl |= 0x08; // TxEmpty
-		if (m_wizfi_rx_fifo.empty()) ctrl |= 0x04; // RxEmpty
+		// Control register ($FF20)
+		// Bit 7: TxEmpty
+		// Bit 6: RxEmpty
+		// Bit 5: 0 (reserved)
+		// Bits 4..0: Baud rate code (0..16, reset value 10 = 115,200)
+		uint8_t ctrl = m_wizfi_baud_code & 0x1f;
+		if (m_wizfi_tx_buf.empty() && m_wizfi_cipsend_remaining == 0)
+			ctrl |= 0x80; // TxEmpty
+		if (m_wizfi_rx_fifo.empty())
+			ctrl |= 0x40; // RxEmpty
 		return ctrl;
 	}
-	case 0x01: {
+	case 0x01:
+		// Reset register ($FF21): Bit 7 reads 1 (HasReset flag), bits 6..3 read 0, bits 2..0 = WIFI_Reset_Register
+		return 0x80 | (m_wizfi_reset_reg & 0x07);
+	case 0x02: {
+		// Data port ($FF22): Rx FIFO pop
 		if (!m_wizfi_rx_fifo.empty())
 		{
 			uint8_t b = m_wizfi_rx_fifo.front();
@@ -2011,15 +2041,15 @@ uint8_t wildbits_jr2_state::wizfi_r(offs_t offset)
 		}
 		return 0x00;
 	}
-	case 0x02: return 0x00; // Rx RD cnt hi
-	case 0x03: return 0x00; // Rx RD cnt lo
-	case 0x04: return (m_wizfi_rx_fifo.size() >> 8) & 0xff; // Rx WR cnt hi (available bytes)
-	case 0x05: return m_wizfi_rx_fifo.size() & 0xff;        // Rx WR cnt lo
-	case 0x06: return 0x00; // Tx RD cnt hi
-	case 0x07: return 0x00; // Tx RD cnt lo
-	case 0x08: return (m_wizfi_tx_buf.length() >> 8) & 0xff; // Tx WR cnt hi
-	case 0x09: return m_wizfi_tx_buf.length() & 0xff;        // Tx WR cnt lo
-	default: return 0x00;
+	case 0x03: return 0x00; // Rx RD cnt hi (11-bit)
+	case 0x04: return 0x00; // Rx RD cnt lo
+	case 0x05: return (m_wizfi_rx_fifo.size() >> 8) & 0x07; // Rx WR cnt hi
+	case 0x06: return m_wizfi_rx_fifo.size() & 0xff;        // Rx WR cnt lo
+	case 0x07: return 0x00; // Tx RD cnt hi
+	case 0x08: return 0x00; // Tx RD cnt lo
+	case 0x09: return (m_wizfi_tx_buf.length() >> 8) & 0x07; // Tx WR cnt hi
+	case 0x0a: return m_wizfi_tx_buf.length() & 0xff;        // Tx WR cnt lo
+	default: return 0x55;
 	}
 }
 
@@ -2028,22 +2058,33 @@ void wildbits_jr2_state::wizfi_w(offs_t offset, uint8_t data)
 	io_wait_write();
 	switch (offset)
 	{
-	case 0x00: {
-		bool was_in_reset = (m_wizfi_ctrl & 0x02) != 0;
-		bool now_in_reset = (data & 0x02) != 0;
-		m_wizfi_ctrl = data & 0x03;
-		if (now_in_reset)
+	case 0x00:
+		m_wizfi_baud_code = data & 0x1f;
+		break;
+	case 0x01: {
+		uint8_t old_reset = m_wizfi_reset_reg;
+		m_wizfi_reset_reg = data & 0x07;
+		if (data & 0x01) // Bit 0: Chip reset
 		{
 			reset_wizfi();
-			m_wizfi_ctrl |= 0x02;
+			// Pin T14 coupling: Setting bit 0 of $FF21 simultaneously resets SAM2695
+			m_sam2695_ctrl = 0;
+			while (!m_sam2695_rx_fifo.empty())
+				m_sam2695_rx_fifo.pop();
 		}
-		else if (was_in_reset && !now_in_reset)
+		else if (old_reset & 0x01)
 		{
 			push_wizfi_response("\r\nready\r\nWIFI CONNECTED\r\nWIFI GOT IP\r\n");
 		}
+		if (data & 0x02) // Bit 1: FIFO reset
+		{
+			while (!m_wizfi_rx_fifo.empty())
+				m_wizfi_rx_fifo.pop();
+			m_wizfi_tx_buf.clear();
+		}
 		break;
 	}
-	case 0x01:
+	case 0x02:
 		if (m_wizfi_transparent)
 		{
 			if (data == '+')
@@ -2109,6 +2150,8 @@ void wildbits_jr2_state::wizfi_w(offs_t offset, uint8_t data)
 				m_wizfi_tx_buf += (char)data;
 			}
 		}
+		break;
+	default:
 		break;
 	}
 }
@@ -2388,61 +2431,16 @@ void wildbits_jr2_state::fpu_w(offs_t offset, uint8_t data)
 uint8_t wildbits_jr2_state::dma_read_byte(uint32_t phys_addr)
 {
 	phys_addr &= 0x1fffff;
-	uint8_t block = (phys_addr >> 13) & 0xff;
-	uint16_t offset = phys_addr & 0x1fff;
-	if (block < 0x40)
-		return m_ram[block * 0x2000 + offset];
-	else if (block >= 0x40 && block < 0x80)
-	{
-		if (m_mmu_io_ctrl & 0x04)
-			return m_ram[block * 0x2000 + offset];
-		else
-			return m_flash[(block - 0x40) * 0x2000 + offset];
-	}
-	else if (block >= 0x80 && block < 0xa0)
-	{
-		if (m_mmu_io_ctrl & 0x04)
-			return m_ram[block * 0x2000 + offset];
-		else
-			return m_cart[(block - 0x80) * 0x2000 + offset];
-	}
-	else if (block >= 0xa0 && block < 0xc0)
-		return m_ram[block * 0x2000 + offset];
-	else if (block >= 0xd0 && block < 0xf0)
-		return m_ram[block * 0x2000 + offset];
-	return 0xff; // Internal FPGA BRAM ($C0-$C6), I/O ($C7-$CF), and unmapped ($F0-$FF)
+	if (phys_addr < 0x1f8000)
+		return m_ram[phys_addr];
+	return 0xff; // Blocks $FC-$FF (internal FPGA BRAM / Sectored I/O, not on external SRAM bus)
 }
 
 void wildbits_jr2_state::dma_write_byte(uint32_t phys_addr, uint8_t data)
 {
 	phys_addr &= 0x1fffff;
-	uint8_t block = (phys_addr >> 13) & 0xff;
-	uint16_t offset = phys_addr & 0x1fff;
-	if (block < 0x40)
-	{
-		m_ram[block * 0x2000 + offset] = data;
-	}
-	else if (block >= 0x40 && block < 0x80)
-	{
-		if (m_mmu_io_ctrl & 0x04)
-			m_ram[block * 0x2000 + offset] = data;
-	}
-	else if (block >= 0x80 && block < 0xa0)
-	{
-		if (m_mmu_io_ctrl & 0x04)
-			m_ram[block * 0x2000 + offset] = data;
-		else
-			m_cart[(block - 0x80) * 0x2000 + offset] = data;
-	}
-	else if (block >= 0xa0 && block < 0xc0)
-	{
-		m_ram[block * 0x2000 + offset] = data;
-	}
-	else if (block >= 0xd0 && block < 0xf0)
-	{
-		m_ram[block * 0x2000 + offset] = data;
-	}
-	// Blocks $C0-$C6 (internal FPGA BRAM) are ignored by the SRAM DMA controller
+	if (phys_addr < 0x1f8000)
+		m_ram[phys_addr] = data;
 }
 
 void wildbits_jr2_state::dma_execute()
@@ -2450,7 +2448,7 @@ void wildbits_jr2_state::dma_execute()
 	bool is_2d = (m_dma_reg[0] & 0x02) != 0;
 	bool is_fill = (m_dma_reg[0] & 0x04) != 0;
 	bool int_en = (m_dma_reg[0] & 0x08) != 0;
-	bool is_16bit_fill = (m_dma_reg[0] & 0x40) != 0;
+	bool double_speed = (m_dma_reg[0] & 0x40) != 0;
 
 	// Byte-lane mask: bits 5:4 (bit 4 = even lane / LSB, bit 5 = odd lane / MSB)
 	bool mask_even = (m_dma_reg[0] & 0x10) != 0;
@@ -2515,54 +2513,108 @@ void wildbits_jr2_state::dma_execute()
 
 	if (!is_2d)
 	{
-		// 1D Linear Transfer: non-contiguous length {m_dma_reg[15], m_dma_reg[12], m_dma_reg[13]}
-		uint32_t count = ((uint32_t)m_dma_reg[15] << 16) | ((uint32_t)m_dma_reg[12] << 8) | m_dma_reg[13];
+		// 1D Linear Transfer: length {m_dma_reg[15], m_dma_reg[12], m_dma_reg[13]} masked to 17 bits
+		uint32_t count = (((uint32_t)m_dma_reg[15] << 16) | ((uint32_t)m_dma_reg[12] << 8) | m_dma_reg[13]) & 0x1ffff;
 		if (count > 0)
 		{
 			if (is_fill)
 			{
-				for (uint32_t i = 0; i < count; i++)
+				if (double_speed)
 				{
-					uint32_t d_addr = (dst + i) & 0x1fffff;
-					bool masked = (d_addr & 1) ? mask_odd : mask_even;
-					if (!masked)
+					for (uint32_t i = 0; i < count; i += 2)
 					{
-						uint8_t fb = is_16bit_fill ? ((i & 1) ? m_dma_reg[3] : m_dma_reg[2]) : fill_byte;
-						if (has_logic_op)
+						uint32_t d_addr = (dst + i) & 0x1ffffe;
+						if (!mask_even)
 						{
-							uint8_t d_val = dma_read_byte(d_addr);
-							dma_write_byte(d_addr, apply_op(fb, d_val));
+							uint8_t fb = m_dma_reg[2];
+							if (has_logic_op)
+								dma_write_byte(d_addr, apply_op(fb, dma_read_byte(d_addr)));
+							else
+								dma_write_byte(d_addr, fb);
 						}
-						else
+						if (!mask_odd && (i + 1 < count))
 						{
-							dma_write_byte(d_addr, fb);
+							uint8_t fb = m_dma_reg[3];
+							if (has_logic_op)
+								dma_write_byte(d_addr + 1, apply_op(fb, dma_read_byte(d_addr + 1)));
+							else
+								dma_write_byte(d_addr + 1, fb);
 						}
 					}
+					cycles = has_logic_op ? (count / 12) : (count / 32);
 				}
-				cycles = has_logic_op ? (count / 6) : (count / 16);
+				else
+				{
+					for (uint32_t i = 0; i < count; i++)
+					{
+						uint32_t d_addr = (dst + i) & 0x1fffff;
+						bool masked = (d_addr & 1) ? mask_odd : mask_even;
+						if (!masked)
+						{
+							if (has_logic_op)
+							{
+								uint8_t d_val = dma_read_byte(d_addr);
+								dma_write_byte(d_addr, apply_op(fill_byte, d_val));
+							}
+							else
+							{
+								dma_write_byte(d_addr, fill_byte);
+							}
+						}
+					}
+					cycles = has_logic_op ? (count / 6) : (count / 16);
+				}
 			}
 			else
 			{
-				for (uint32_t i = 0; i < count; i++)
+				if (double_speed)
 				{
-					uint32_t s_addr = (src + i) & 0x1fffff;
-					uint32_t d_addr = (dst + i) & 0x1fffff;
-					bool masked = (d_addr & 1) ? mask_odd : mask_even;
-					if (!masked)
+					for (uint32_t i = 0; i < count; i += 2)
 					{
-						uint8_t s_val = dma_read_byte(s_addr);
-						if (has_logic_op)
+						uint32_t s_addr = (src + i) & 0x1ffffe;
+						uint32_t d_addr = (dst + i) & 0x1ffffe;
+						if (!mask_even)
 						{
-							uint8_t d_val = dma_read_byte(d_addr);
-							dma_write_byte(d_addr, apply_op(s_val, d_val));
+							uint8_t s_val = dma_read_byte(s_addr);
+							if (has_logic_op)
+								dma_write_byte(d_addr, apply_op(s_val, dma_read_byte(d_addr)));
+							else
+								dma_write_byte(d_addr, s_val);
 						}
-						else
+						if (!mask_odd && (i + 1 < count))
 						{
-							dma_write_byte(d_addr, s_val);
+							uint8_t s_val = dma_read_byte(s_addr + 1);
+							if (has_logic_op)
+								dma_write_byte(d_addr + 1, apply_op(s_val, dma_read_byte(d_addr + 1)));
+							else
+								dma_write_byte(d_addr + 1, s_val);
 						}
 					}
+					cycles = has_logic_op ? (count / 4) : (count / 10);
 				}
-				cycles = has_logic_op ? (count / 2) : (count / 5);
+				else
+				{
+					for (uint32_t i = 0; i < count; i++)
+					{
+						uint32_t s_addr = (src + i) & 0x1fffff;
+						uint32_t d_addr = (dst + i) & 0x1fffff;
+						bool masked = (d_addr & 1) ? mask_odd : mask_even;
+						if (!masked)
+						{
+							uint8_t s_val = dma_read_byte(s_addr);
+							if (has_logic_op)
+							{
+								uint8_t d_val = dma_read_byte(d_addr);
+								dma_write_byte(d_addr, apply_op(s_val, d_val));
+							}
+							else
+							{
+								dma_write_byte(d_addr, s_val);
+							}
+						}
+					}
+					cycles = has_logic_op ? (count / 2) : (count / 5);
+				}
 			}
 		}
 	}
@@ -2581,43 +2633,81 @@ void wildbits_jr2_state::dma_execute()
 
 			if (is_fill)
 			{
-				for (uint16_t x = 0; x < width; x++)
+				uint16_t step = double_speed ? 2 : 1;
+				for (uint16_t x = 0; x < width; x += step)
 				{
-					uint32_t d_addr = (row_dst + x) & 0x1fffff;
-					bool masked = (d_addr & 1) ? mask_odd : mask_even;
-					if (!masked)
+					if (double_speed)
 					{
-						uint8_t fb = is_16bit_fill ? ((x & 1) ? m_dma_reg[3] : m_dma_reg[2]) : fill_byte;
-						if (has_logic_op)
+						uint32_t d_addr = (row_dst + x) & 0x1ffffe;
+						if (!mask_even)
 						{
-							uint8_t d_val = dma_read_byte(d_addr);
-							dma_write_byte(d_addr, apply_op(fb, d_val));
+							uint8_t fb = m_dma_reg[2];
+							if (has_logic_op)
+								dma_write_byte(d_addr, apply_op(fb, dma_read_byte(d_addr)));
+							else
+								dma_write_byte(d_addr, fb);
 						}
-						else
+						if (!mask_odd && (x + 1 < width))
 						{
-							dma_write_byte(d_addr, fb);
+							uint8_t fb = m_dma_reg[3];
+							if (has_logic_op)
+								dma_write_byte(d_addr + 1, apply_op(fb, dma_read_byte(d_addr + 1)));
+							else
+								dma_write_byte(d_addr + 1, fb);
+						}
+					}
+					else
+					{
+						uint32_t d_addr = (row_dst + x) & 0x1fffff;
+						bool masked = (d_addr & 1) ? mask_odd : mask_even;
+						if (!masked)
+						{
+							if (has_logic_op)
+								dma_write_byte(d_addr, apply_op(fill_byte, dma_read_byte(d_addr)));
+							else
+								dma_write_byte(d_addr, fill_byte);
 						}
 					}
 				}
 			}
 			else
 			{
-				for (uint16_t x = 0; x < width; x++)
+				uint16_t step = double_speed ? 2 : 1;
+				for (uint16_t x = 0; x < width; x += step)
 				{
-					uint32_t s_addr = (row_src + x) & 0x1fffff;
-					uint32_t d_addr = (row_dst + x) & 0x1fffff;
-					bool masked = (d_addr & 1) ? mask_odd : mask_even;
-					if (!masked)
+					if (double_speed)
 					{
-						uint8_t s_val = dma_read_byte(s_addr);
-						if (has_logic_op)
+						uint32_t s_addr = (row_src + x) & 0x1ffffe;
+						uint32_t d_addr = (row_dst + x) & 0x1ffffe;
+						if (!mask_even)
 						{
-							uint8_t d_val = dma_read_byte(d_addr);
-							dma_write_byte(d_addr, apply_op(s_val, d_val));
+							uint8_t s_val = dma_read_byte(s_addr);
+							if (has_logic_op)
+								dma_write_byte(d_addr, apply_op(s_val, dma_read_byte(d_addr)));
+							else
+								dma_write_byte(d_addr, s_val);
 						}
-						else
+						if (!mask_odd && (x + 1 < width))
 						{
-							dma_write_byte(d_addr, s_val);
+							uint8_t s_val = dma_read_byte(s_addr + 1);
+							if (has_logic_op)
+								dma_write_byte(d_addr + 1, apply_op(s_val, dma_read_byte(d_addr + 1)));
+							else
+								dma_write_byte(d_addr + 1, s_val);
+						}
+					}
+					else
+					{
+						uint32_t s_addr = (row_src + x) & 0x1fffff;
+						uint32_t d_addr = (row_dst + x) & 0x1fffff;
+						bool masked = (d_addr & 1) ? mask_odd : mask_even;
+						if (!masked)
+						{
+							uint8_t s_val = dma_read_byte(s_addr);
+							if (has_logic_op)
+								dma_write_byte(d_addr, apply_op(s_val, dma_read_byte(d_addr)));
+							else
+								dma_write_byte(d_addr, s_val);
 						}
 					}
 				}
@@ -2625,7 +2715,10 @@ void wildbits_jr2_state::dma_execute()
 		}
 
 		uint32_t total_bytes = (uint32_t)width * height;
-		cycles = is_fill ? (has_logic_op ? (total_bytes / 6) : (total_bytes / 16)) : (has_logic_op ? (total_bytes / 2) : (total_bytes / 5));
+		if (double_speed)
+			cycles = is_fill ? (has_logic_op ? (total_bytes / 12) : (total_bytes / 32)) : (has_logic_op ? (total_bytes / 4) : (total_bytes / 10));
+		else
+			cycles = is_fill ? (has_logic_op ? (total_bytes / 6) : (total_bytes / 16)) : (has_logic_op ? (total_bytes / 2) : (total_bytes / 5));
 	}
 
 	if (cycles > 0)
@@ -2742,7 +2835,7 @@ void wildbits_jr2_state::vky_w(offs_t offset, uint8_t data)
 	// TURBO_FASTIOWRITE: 24-tick fast I/O write frame (~8.39 MHz)
 	io_wait_write();
 	if (offset < 0x20)
-		m_vram_c0[offset] = data;
+		m_vram_fc[offset] = data;
 	switch (offset)
 	{
 	case 0x00:
@@ -2798,7 +2891,7 @@ void wildbits_jr2_state::vky_w(offs_t offset, uint8_t data)
 void wildbits_jr2_state::linedraw_execute()
 {
 	int bm_sel = (m_ld_ctrl >> 2) & 0x03;
-	uint8_t bm_ctrl = (bm_sel == 0) ? m_vram_c0[0x1000] : (bm_sel == 1) ? m_vram_c0[0x1008] : (bm_sel == 2) ? m_vram_c0[0x1010] : 0;
+	uint8_t bm_ctrl = (bm_sel == 0) ? m_vram_fc[0x1000] : (bm_sel == 1) ? m_vram_fc[0x1008] : (bm_sel == 2) ? m_vram_fc[0x1010] : 0;
 	bool hires4 = (m_vky_gfx_mode & 0x01) || (bm_ctrl & 0x10);
 	uint16_t xmax = hires4 ? 640 : 320;
 
@@ -2811,11 +2904,11 @@ void wildbits_jr2_state::linedraw_execute()
 
 	uint32_t bm_base = 0;
 	if (bm_sel == 0)
-		bm_base = ((uint32_t)m_vram_c0[0x1001] << 16) | ((uint32_t)m_vram_c0[0x1002] << 8) | m_vram_c0[0x1003];
+		bm_base = ((uint32_t)m_vram_fc[0x1001] << 16) | ((uint32_t)m_vram_fc[0x1002] << 8) | m_vram_fc[0x1003];
 	else if (bm_sel == 1)
-		bm_base = ((uint32_t)m_vram_c0[0x1009] << 16) | ((uint32_t)m_vram_c0[0x100a] << 8) | m_vram_c0[0x100b];
+		bm_base = ((uint32_t)m_vram_fc[0x1009] << 16) | ((uint32_t)m_vram_fc[0x100a] << 8) | m_vram_fc[0x100b];
 	else if (bm_sel == 2)
-		bm_base = ((uint32_t)m_vram_c0[0x1011] << 16) | ((uint32_t)m_vram_c0[0x1012] << 8) | m_vram_c0[0x1013];
+		bm_base = ((uint32_t)m_vram_fc[0x1011] << 16) | ((uint32_t)m_vram_fc[0x1012] << 8) | m_vram_fc[0x1013];
 	else
 		bm_base = 0x001000;
 
@@ -2850,9 +2943,11 @@ void wildbits_jr2_state::linedraw_execute()
 	int sy = (y0 < y1) ? 1 : -1;
 	int err = dx - dy;
 
+	int pixels = 0;
 	while (true)
 	{
 		plot_pixel(x0, y0);
+		pixels++;
 		if (x0 == x1 && y0 == y1)
 			break;
 		int e2 = 2 * err;
@@ -2867,6 +2962,10 @@ void wildbits_jr2_state::linedraw_execute()
 			y0 += sy;
 		}
 	}
+
+	// Model HoldLine CPU arbitration during line-draw bursts
+	if (pixels > 0)
+		m_maincpu->eat_cycles(pixels);
 
 	m_ld_done = true;
 	m_ld_fifo_count = 0;
@@ -3016,19 +3115,34 @@ uint8_t wildbits_jr2_state::sam2695_r(offs_t offset)
 	io_wait_read();
 	switch (offset)
 	{
-	case 0x00:
-		// Edition 2 Control Register: Bit 3 = Tx_empty, Bit 2 = Rx_empty
-		return 0x0c;
-	case 0x01:
-		return 0x00; // MIDI FIFO data port
-	case 0x02:
-	case 0x03:
-		return 0x00; // RXD_COUNT_LOW/HI
-	case 0x04:
-	case 0x05:
-		return 0x00; // TXD_COUNT_LOW/HI
-	default:
+	case 0x00: {
+		// Edition 3 Control Register ($FF30):
+		// Bit 3 = Tx_empty, Bit 2 = Rx_empty
+		uint8_t ctrl = m_sam2695_ctrl & ~0x0c;
+		ctrl |= 0x08; // Tx_empty (writes dispatch immediately to m_midi_out)
+		if (m_sam2695_rx_fifo.empty())
+			ctrl |= 0x04; // Rx_empty
+		return ctrl;
+	}
+	case 0x01: {
+		// MIDI FIFO data port ($FF31): pop Rx FIFO
+		if (!m_sam2695_rx_fifo.empty())
+		{
+			uint8_t val = m_sam2695_rx_fifo.front();
+			m_sam2695_rx_fifo.pop();
+			return val;
+		}
 		return 0x00;
+	}
+	case 0x02: return 0x00; // Rx RD cnt hi
+	case 0x03: return 0x00; // Rx RD cnt lo
+	case 0x04: return (m_sam2695_rx_fifo.size() >> 8) & 0x07; // Rx WR cnt hi
+	case 0x05: return m_sam2695_rx_fifo.size() & 0xff;        // Rx WR cnt lo
+	case 0x06: return 0x00; // Tx RD cnt hi
+	case 0x07: return 0x00; // Tx RD cnt lo
+	case 0x08: return 0x00; // Tx WR cnt hi
+	case 0x09: return 0x00; // Tx WR cnt lo
+	default: return 0x55;
 	}
 }
 
@@ -3038,11 +3152,14 @@ void wildbits_jr2_state::sam2695_w(offs_t offset, uint8_t data)
 	switch (offset)
 	{
 	case 0x00:
-		// Bit 1 = FIFO_Reset
 		m_sam2695_ctrl = data;
+		if (data & 0x02) // Bit 1 = FIFO_Reset
+		{
+			while (!m_sam2695_rx_fifo.empty())
+				m_sam2695_rx_fifo.pop();
+		}
 		break;
 	case 0x01:
-		// MIDI FIFO data port sink & host MIDI output
 		if (m_midi_out)
 			m_midi_out->write(data);
 		break;
@@ -4079,16 +4196,16 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 	// Lambda to render a single 256-color Bitmap plane (0..2)
 	auto render_bitmap_plane = [&](int p) {
 		uint16_t reg_base = 0x1000 + p * 8;
-		uint8_t bm_ctrl = m_vram_c0[reg_base + 0];
+		uint8_t bm_ctrl = m_vram_fc[reg_base + 0];
 		if (!(bm_ctrl & 0x01))
 			return;
 
 		uint8_t clut_idx = (bm_ctrl >> 1) & 0x03;
 		uint16_t clut_base = 0x1000 + clut_idx * 0x0400;
 
-		uint32_t start_addr = ((uint32_t)m_vram_c0[reg_base + 1] << 16) |
-		                      ((uint32_t)m_vram_c0[reg_base + 2] << 8) |
-		                      m_vram_c0[reg_base + 3];
+		uint32_t start_addr = ((uint32_t)m_vram_fc[reg_base + 1] << 16) |
+		                      ((uint32_t)m_vram_fc[reg_base + 2] << 8) |
+		                      m_vram_fc[reg_base + 3];
 
 		bool is_hires4 = (m_vky_gfx_mode & 0x01) || (bm_ctrl & 0x10);
 		uint8_t clut_grp = (bm_ctrl & 0x10) ? ((bm_ctrl >> 5) & 0x07) : ((m_vky_gfx_mode >> 1) & 0x07);
@@ -4121,14 +4238,14 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 					{
 						uint8_t color_idx = (clut_grp << 4) | nib0;
 						uint16_t entry_offset = clut_base + color_idx * 4;
-						uint8_t b = m_vram_c1[entry_offset + 0];
-						uint8_t g = m_vram_c1[entry_offset + 1];
-						uint8_t r = m_vram_c1[entry_offset + 2];
+						uint8_t b = m_vram_fd[entry_offset + 0];
+						uint8_t g = m_vram_fd[entry_offset + 1];
+						uint8_t r = m_vram_fd[entry_offset + 2];
 						if (gamma_en)
 						{
-							b = m_vram_c0[0x0000 + b];
-							g = m_vram_c0[0x0400 + g];
-							r = m_vram_c0[0x0800 + r];
+							b = m_vram_fc[0x0000 + b];
+							g = m_vram_fc[0x0400 + g];
+							r = m_vram_fc[0x0800 + r];
 						}
 						rgb_t pen(r, g, b);
 						if (sx0 >= cliprect.min_x && sx0 <= cliprect.max_x)
@@ -4144,14 +4261,14 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 					{
 						uint8_t color_idx = (clut_grp << 4) | nib1;
 						uint16_t entry_offset = clut_base + color_idx * 4;
-						uint8_t b = m_vram_c1[entry_offset + 0];
-						uint8_t g = m_vram_c1[entry_offset + 1];
-						uint8_t r = m_vram_c1[entry_offset + 2];
+						uint8_t b = m_vram_fd[entry_offset + 0];
+						uint8_t g = m_vram_fd[entry_offset + 1];
+						uint8_t r = m_vram_fd[entry_offset + 2];
 						if (gamma_en)
 						{
-							b = m_vram_c0[0x0000 + b];
-							g = m_vram_c0[0x0400 + g];
-							r = m_vram_c0[0x0800 + r];
+							b = m_vram_fc[0x0000 + b];
+							g = m_vram_fc[0x0400 + g];
+							r = m_vram_fc[0x0800 + r];
 						}
 						rgb_t pen(r, g, b);
 						if (sx1 >= cliprect.min_x && sx1 <= cliprect.max_x)
@@ -4173,15 +4290,15 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 						continue; // Transparent pixel
 
 					uint16_t entry_offset = clut_base + color_idx * 4;
-					uint8_t b = m_vram_c1[entry_offset + 0];
-					uint8_t g = m_vram_c1[entry_offset + 1];
-					uint8_t r = m_vram_c1[entry_offset + 2];
+					uint8_t b = m_vram_fd[entry_offset + 0];
+					uint8_t g = m_vram_fd[entry_offset + 1];
+					uint8_t r = m_vram_fd[entry_offset + 2];
 
 					if (gamma_en)
 					{
-						b = m_vram_c0[0x0000 + b];
-						g = m_vram_c0[0x0400 + g];
-						r = m_vram_c0[0x0800 + r];
+						b = m_vram_fc[0x0000 + b];
+						g = m_vram_fc[0x0400 + g];
+						r = m_vram_fc[0x0800 + r];
 					}
 
 					rgb_t pen(r, g, b);
@@ -4218,7 +4335,7 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 		for (int s = 127; s >= 0; s--)
 		{
 			uint16_t rec_base = 0x1300 + s * 8;
-			uint8_t ctrl = m_vram_c0[rec_base + 0];
+			uint8_t ctrl = m_vram_fc[rec_base + 0];
 			if (!(ctrl & 0x01)) // Sprite disabled
 				continue;
 
@@ -4238,12 +4355,12 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 			case 3: spr_w =  8; spr_h =  8; break; // 8x8
 			}
 
-			uint32_t start_addr = ((uint32_t)m_vram_c0[rec_base + 1] << 16) |
-			                      ((uint32_t)m_vram_c0[rec_base + 2] << 8) |
-			                      m_vram_c0[rec_base + 3];
+			uint32_t start_addr = ((uint32_t)m_vram_fc[rec_base + 1] << 16) |
+			                      ((uint32_t)m_vram_fc[rec_base + 2] << 8) |
+			                      m_vram_fc[rec_base + 3];
 
-			int16_t spr_x = (int16_t)(((uint16_t)m_vram_c0[rec_base + 4] << 8) | m_vram_c0[rec_base + 5]);
-			int16_t spr_y = (int16_t)(((uint16_t)m_vram_c0[rec_base + 6] << 8) | m_vram_c0[rec_base + 7]);
+			int16_t spr_x = (int16_t)(((uint16_t)m_vram_fc[rec_base + 4] << 8) | m_vram_fc[rec_base + 5]);
+			int16_t spr_y = (int16_t)(((uint16_t)m_vram_fc[rec_base + 6] << 8) | m_vram_fc[rec_base + 7]);
 
 			// 32-pixel off-screen coordinate margin
 			int vis_x = spr_x - 32;
@@ -4280,15 +4397,15 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 						continue; // Transparent pixel
 
 					uint16_t entry_offset = clut_base + color_idx * 4;
-					uint8_t b = m_vram_c1[entry_offset + 0];
-					uint8_t g = m_vram_c1[entry_offset + 1];
-					uint8_t r = m_vram_c1[entry_offset + 2];
+					uint8_t b = m_vram_fd[entry_offset + 0];
+					uint8_t g = m_vram_fd[entry_offset + 1];
+					uint8_t r = m_vram_fd[entry_offset + 2];
 
 					if (gamma_en)
 					{
-						b = m_vram_c0[0x0000 + b];
-						g = m_vram_c0[0x0400 + g];
-						r = m_vram_c0[0x0800 + r];
+						b = m_vram_fc[0x0000 + b];
+						g = m_vram_fc[0x0400 + g];
+						r = m_vram_fc[0x0800 + r];
 					}
 
 					rgb_t pen(r, g, b);
@@ -4321,7 +4438,7 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 			return;
 
 		uint16_t tm_base = 0x1100 + tm_idx * 12;
-		uint8_t tm_ctrl = m_vram_c0[tm_base + 0];
+		uint8_t tm_ctrl = m_vram_fc[tm_base + 0];
 		if (!(tm_ctrl & 0x01)) // Tilemap disabled
 			return;
 
@@ -4329,17 +4446,17 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 
 		// 24-bit physical RAM pointer to tilemap matrix
 		// Per defs/wildbits.d: +1: TLk_START_ADDY_H, +2: TLk_START_ADDY_M, +3: TLk_START_ADDY_L
-		uint8_t b1 = m_vram_c0[tm_base + 1];
-		uint8_t b2 = m_vram_c0[tm_base + 2];
-		uint8_t b3 = m_vram_c0[tm_base + 3];
+		uint8_t b1 = m_vram_fc[tm_base + 1];
+		uint8_t b2 = m_vram_fc[tm_base + 2];
+		uint8_t b3 = m_vram_fc[tm_base + 3];
 		uint32_t start_addr = ((uint32_t)b1 << 16) | ((uint32_t)b2 << 8) | b3;
 
 		// Virtual map size in tiles (Big-Endian on FNX6809: +4: SIZE_H, +5: SIZE_L)
-		uint16_t map_w = ((uint16_t)m_vram_c0[tm_base + 4] << 8) | m_vram_c0[tm_base + 5];
+		uint16_t map_w = ((uint16_t)m_vram_fc[tm_base + 4] << 8) | m_vram_fc[tm_base + 5];
 		if (map_w == 0)
 			map_w = (bm_w / tile_size);
 
-		uint16_t map_h = ((uint16_t)m_vram_c0[tm_base + 6] << 8) | m_vram_c0[tm_base + 7];
+		uint16_t map_h = ((uint16_t)m_vram_fc[tm_base + 6] << 8) | m_vram_fc[tm_base + 7];
 		if (map_h == 0)
 			map_h = (bm_h / tile_size);
 
@@ -4348,8 +4465,8 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 
 		// Scroll offsets in pixels (FNX6809 hardware register pairs are Big-Endian:
 		// +8: POS_H, +9: POS_L, +10: POS_H, +11: POS_L)
-		uint16_t scroll_x = ((uint16_t)m_vram_c0[tm_base + 8] << 8) | m_vram_c0[tm_base + 9];
-		uint16_t scroll_y = ((uint16_t)m_vram_c0[tm_base + 10] << 8) | m_vram_c0[tm_base + 11];
+		uint16_t scroll_x = ((uint16_t)m_vram_fc[tm_base + 8] << 8) | m_vram_fc[tm_base + 9];
+		uint16_t scroll_y = ((uint16_t)m_vram_fc[tm_base + 10] << 8) | m_vram_fc[tm_base + 11];
 
 		int total_w_pix = (int)map_w * tile_size;
 		int total_h_pix = (int)map_h * tile_size;
@@ -4402,17 +4519,17 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 				// +3: TILE_MAP_ADDY_L (Physical RAM address 7:0)
 				bool square;
 				uint32_t ts_addr;
-				if (m_vram_c0[ts_reg + 0] <= 0x0f && m_vram_c0[ts_reg + 1] <= 0x1f)
+				if (m_vram_fc[ts_reg + 0] <= 0x0f && m_vram_fc[ts_reg + 1] <= 0x1f)
 				{
 					// Standard Wildbits Jr2 layout
-					square = (m_vram_c0[ts_reg + 0] & 0x08) != 0;
-					ts_addr = ((uint32_t)m_vram_c0[ts_reg + 1] << 16) | ((uint32_t)m_vram_c0[ts_reg + 2] << 8) | m_vram_c0[ts_reg + 3];
+					square = (m_vram_fc[ts_reg + 0] & 0x08) != 0;
+					ts_addr = ((uint32_t)m_vram_fc[ts_reg + 1] << 16) | ((uint32_t)m_vram_fc[ts_reg + 2] << 8) | m_vram_fc[ts_reg + 3];
 				}
 				else
 				{
 					// Legacy C256 / F256 fallback (+0..+2 L, M, H, +3 CFG)
-					square = (m_vram_c0[ts_reg + 3] & 0x08) != 0;
-					ts_addr = ((uint32_t)m_vram_c0[ts_reg + 2] << 16) | ((uint32_t)m_vram_c0[ts_reg + 1] << 8) | m_vram_c0[ts_reg + 0];
+					square = (m_vram_fc[ts_reg + 3] & 0x08) != 0;
+					ts_addr = ((uint32_t)m_vram_fc[ts_reg + 2] << 16) | ((uint32_t)m_vram_fc[ts_reg + 1] << 8) | m_vram_fc[ts_reg + 0];
 				}
 
 				uint32_t pix_addr;
@@ -4439,15 +4556,15 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 
 				uint16_t clut_base = 0x1000 + clut_idx * 0x0400;
 				uint16_t entry_offset = clut_base + color_idx * 4;
-				uint8_t b = m_vram_c1[entry_offset + 0];
-				uint8_t g = m_vram_c1[entry_offset + 1];
-				uint8_t r = m_vram_c1[entry_offset + 2];
+				uint8_t b = m_vram_fd[entry_offset + 0];
+				uint8_t g = m_vram_fd[entry_offset + 1];
+				uint8_t r = m_vram_fd[entry_offset + 2];
 
 				if (gamma_en)
 				{
-					b = m_vram_c0[0x0000 + b];
-					g = m_vram_c0[0x0400 + g];
-					r = m_vram_c0[0x0800 + r];
+					b = m_vram_fc[0x0000 + b];
+					g = m_vram_fc[0x0400 + g];
+					r = m_vram_fc[0x0800 + r];
 				}
 
 				rgb_t pen(r, g, b);
@@ -4490,9 +4607,9 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 	// Helper to check if a bitmap/tilemap plane is active/enabled
 	auto has_plane = [&](int p) -> bool {
 		if (p <= 2)
-			return bitmap_en && ((m_vram_c0[0x1000 + p * 8] & 0x01) != 0);
+			return bitmap_en && ((m_vram_fc[0x1000 + p * 8] & 0x01) != 0);
 		else if (p >= 4 && p <= 6)
-			return tile_en && ((m_vram_c0[0x1100 + (p - 4) * 12] & 0x01) != 0);
+			return tile_en && ((m_vram_fc[0x1100 + (p - 4) * 12] & 0x01) != 0);
 		return false;
 	};
 
@@ -4544,18 +4661,18 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 	// Render Text Mode
 	if (text_en)
 	{
-		bool memtext_mode = ((m_vky_mstr_ctrl_1 & 0x40) != 0) && ((m_vram_c0[0x1200] & 0x01) != 0);
+		bool memtext_mode = ((m_vky_mstr_ctrl_1 & 0x40) != 0) && ((m_vram_fc[0x1200] & 0x01) != 0);
 		bool memtext_show_bg = (m_vky_mstr_ctrl_1 & 0x80) != 0;
 
 		if (memtext_mode)
 		{
-			bool font_8x16 = (m_vram_c0[0x1200] & 0x02) != 0;
+			bool font_8x16 = (m_vram_fc[0x1200] & 0x02) != 0;
 			int font_h = font_8x16 ? 16 : 8;
 			int cols = 80;
 			int rows = font_8x16 ? (clk_70 ? 25 : 30) : (clk_70 ? 50 : 60);
 
-			uint32_t text_base = ((uint32_t)m_vram_c0[0x1205] << 16) | ((uint32_t)m_vram_c0[0x1206] << 8) | m_vram_c0[0x1207];
-			uint32_t color_base = ((uint32_t)m_vram_c0[0x1209] << 16) | ((uint32_t)m_vram_c0[0x120a] << 8) | m_vram_c0[0x120b];
+			uint32_t text_base = ((uint32_t)m_vram_fc[0x1205] << 16) | ((uint32_t)m_vram_fc[0x1206] << 8) | m_vram_fc[0x1207];
+			uint32_t color_base = ((uint32_t)m_vram_fc[0x1209] << 16) | ((uint32_t)m_vram_fc[0x120a] << 8) | m_vram_fc[0x120b];
 
 			for (int row = 0; row < rows; row++)
 			{
@@ -4579,26 +4696,26 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 						invert = !invert;
 
 					uint16_t fg_entry = ((fg_slot * 256 + fg_idx) * 4) & 0x03ff;
-					uint8_t fg_b = m_vram_c5[0x0000 + fg_entry + 0];
-					uint8_t fg_g = m_vram_c5[0x0000 + fg_entry + 1];
-					uint8_t fg_r = m_vram_c5[0x0000 + fg_entry + 2];
+					uint8_t fg_b = m_memtext_clut[0x0000 + fg_entry + 0];
+					uint8_t fg_g = m_memtext_clut[0x0000 + fg_entry + 1];
+					uint8_t fg_r = m_memtext_clut[0x0000 + fg_entry + 2];
 					if (gamma_en)
 					{
-						fg_b = m_vram_c0[0x0000 + fg_b];
-						fg_g = m_vram_c0[0x0400 + fg_g];
-						fg_r = m_vram_c0[0x0800 + fg_r];
+						fg_b = m_vram_fc[0x0000 + fg_b];
+						fg_g = m_vram_fc[0x0400 + fg_g];
+						fg_r = m_vram_fc[0x0800 + fg_r];
 					}
 					rgb_t fg_pen(fg_r, fg_g, fg_b);
 
 					uint16_t bg_entry = ((bg_slot * 256 + bg_idx) * 4) & 0x03ff;
-					uint8_t bg_b = m_vram_c5[0x0800 + bg_entry + 0];
-					uint8_t bg_g = m_vram_c5[0x0800 + bg_entry + 1];
-					uint8_t bg_r = m_vram_c5[0x0800 + bg_entry + 2];
+					uint8_t bg_b = m_memtext_clut[0x0800 + bg_entry + 0];
+					uint8_t bg_g = m_memtext_clut[0x0800 + bg_entry + 1];
+					uint8_t bg_r = m_memtext_clut[0x0800 + bg_entry + 2];
 					if (gamma_en)
 					{
-						bg_b = m_vram_c0[0x0000 + bg_b];
-						bg_g = m_vram_c0[0x0400 + bg_g];
-						bg_r = m_vram_c0[0x0800 + bg_r];
+						bg_b = m_vram_fc[0x0000 + bg_b];
+						bg_g = m_vram_fc[0x0400 + bg_g];
+						bg_r = m_vram_fc[0x0800 + bg_r];
 					}
 					rgb_t bg_pen(bg_r, bg_g, bg_b);
 
@@ -4609,7 +4726,7 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 						uint16_t font_addr = font_8x16
 							? (uint16_t)((font_slot * 4096) + (ch * 16) + cy)
 							: (uint16_t)((font_slot * 2048) + (ch * 8) + cy);
-						uint8_t glyph_row = m_vram_c6[font_addr & 0x1fff];
+						uint8_t glyph_row = m_vram_fd[font_addr & 0x0fff];
 						if (invert)
 							glyph_row ^= 0xff;
 
@@ -4648,7 +4765,7 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 			}
 
 			// Render MemText hardware cursor
-			uint8_t crsr_ctrl = m_vram_c0[0x1201];
+			uint8_t crsr_ctrl = m_vram_fc[0x1201];
 			if (crsr_ctrl & 0x01)
 			{
 				bool crsr_flash = (crsr_ctrl & 0x04) != 0;
@@ -4656,24 +4773,24 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 				bool crsr_visible = !crsr_flash || (((m_frame_count / flash_rate) & 1) == 0);
 				if (crsr_visible)
 				{
-					int crsr_col = m_vram_c0[0x1202];
-					int crsr_row = m_vram_c0[0x1203];
+					int crsr_col = m_vram_fc[0x1202];
+					int crsr_row = m_vram_fc[0x1203];
 					if (crsr_col >= 0 && crsr_col < cols && crsr_row >= 0 && crsr_row < rows)
 					{
-						uint8_t cr_b = m_vram_c0[0x120d];
-						uint8_t cr_g = m_vram_c0[0x120e];
-						uint8_t cr_r = m_vram_c0[0x120f];
+						uint8_t cr_b = m_vram_fc[0x120d];
+						uint8_t cr_g = m_vram_fc[0x120e];
+						uint8_t cr_r = m_vram_fc[0x120f];
 						if (gamma_en)
 						{
-							cr_b = m_vram_c0[0x0000 + cr_b];
-							cr_g = m_vram_c0[0x0400 + cr_g];
-							cr_r = m_vram_c0[0x0800 + cr_r];
+							cr_b = m_vram_fc[0x0000 + cr_b];
+							cr_g = m_vram_fc[0x0400 + cr_g];
+							cr_r = m_vram_fc[0x0800 + cr_r];
 						}
 						rgb_t crsr_pen(cr_r, cr_g, cr_b);
 
 						for (int cy = 0; cy < font_h; cy++)
 						{
-							uint8_t pat = m_vram_c0[0x1210 + cy];
+							uint8_t pat = m_vram_fc[0x1210 + cy];
 							int py = crsr_row * font_h + cy;
 							if (py >= cliprect.min_y && py <= cliprect.max_y)
 							{
@@ -4714,39 +4831,39 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 				for (int col = 0; col < cols; col++)
 				{
 					int cell_idx = row * cols + col;
-					uint8_t ch = m_vram_c2[cell_idx];
-					uint8_t attr = m_vram_c3[cell_idx];
+					uint8_t ch = m_vram_fe[cell_idx];
+					uint8_t attr = m_vram_ff[cell_idx];
 
 					uint8_t fg_idx = (attr >> 4) & 0x0f;
 					uint8_t bg_idx = attr & 0x0f;
 
-					// Palette lookup from Block $C0 (FG at $1700, BG at $1740)
-					uint8_t fg_b = m_vram_c0[0x1700 + fg_idx * 4 + 0];
-					uint8_t fg_g = m_vram_c0[0x1700 + fg_idx * 4 + 1];
-					uint8_t fg_r = m_vram_c0[0x1700 + fg_idx * 4 + 2];
+					// Palette lookup from Block $FC (FG at $1700, BG at $1740)
+					uint8_t fg_b = m_vram_fc[0x1700 + fg_idx * 4 + 0];
+					uint8_t fg_g = m_vram_fc[0x1700 + fg_idx * 4 + 1];
+					uint8_t fg_r = m_vram_fc[0x1700 + fg_idx * 4 + 2];
 					if (gamma_en)
 					{
-						fg_b = m_vram_c0[0x0000 + fg_b];
-						fg_g = m_vram_c0[0x0400 + fg_g];
-						fg_r = m_vram_c0[0x0800 + fg_r];
+						fg_b = m_vram_fc[0x0000 + fg_b];
+						fg_g = m_vram_fc[0x0400 + fg_g];
+						fg_r = m_vram_fc[0x0800 + fg_r];
 					}
 					rgb_t fg_pen(fg_r, fg_g, fg_b);
 
-					uint8_t bg_b = m_vram_c0[0x1740 + bg_idx * 4 + 0];
-					uint8_t bg_g = m_vram_c0[0x1740 + bg_idx * 4 + 1];
-					uint8_t bg_r = m_vram_c0[0x1740 + bg_idx * 4 + 2];
+					uint8_t bg_b = m_vram_fc[0x1740 + bg_idx * 4 + 0];
+					uint8_t bg_g = m_vram_fc[0x1740 + bg_idx * 4 + 1];
+					uint8_t bg_r = m_vram_fc[0x1740 + bg_idx * 4 + 2];
 					if (gamma_en)
 					{
-						bg_b = m_vram_c0[0x0000 + bg_b];
-						bg_g = m_vram_c0[0x0400 + bg_g];
-						bg_r = m_vram_c0[0x0800 + bg_r];
+						bg_b = m_vram_fc[0x0000 + bg_b];
+						bg_g = m_vram_fc[0x0400 + bg_g];
+						bg_r = m_vram_fc[0x0800 + bg_r];
 					}
 					rgb_t bg_pen(bg_r, bg_g, bg_b);
 
 					// Render character cell
 					for (int cy = 0; cy < 8; cy++)
 					{
-						uint8_t glyph_row = m_vram_c1[font_base + ch * 8 + cy];
+						uint8_t glyph_row = m_vram_fd[font_base + ch * 8 + cy];
 
 						for (int dy = 0; dy < y_scale; dy++)
 						{
@@ -4835,7 +4952,7 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 				int px = m_mouse_x + cx;
 				if (px >= cliprect.min_x && px <= cliprect.max_x)
 				{
-					uint8_t pix = m_vram_c0[0x0c00 + cy * 16 + cx];
+					uint8_t pix = m_vram_fc[0x0c00 + cy * 16 + cx];
 					if (pix == 255)
 					{
 						dest[px] = rgb_t(0xff, 0xff, 0xff); // White border
@@ -4879,13 +4996,11 @@ void wildbits_jr2_state::machine_start()
 	std::fill_n(m_cart.get(), 0x40000, 0xff);
 	m_unmapped = std::make_unique<uint8_t[]>(0x2000);   // 8KB dummy unmapped page
 	std::fill_n(m_unmapped.get(), 0x2000, 0xff);
-	m_vram_c0 = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $C0
-	m_vram_c1 = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $C1 (Fonts & LUTs)
-	m_vram_c2 = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $C2 (Text Matrix)
-	m_vram_c3 = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $C3 (Color Matrix)
-	m_vram_c4 = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $C4 (Audio)
-	m_vram_c5 = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $C5 (MemText FG/BG CLUTs)
-	m_vram_c6 = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $C6 (MemText Font BRAM)
+	m_vram_fc = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $FC
+	m_vram_fd = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $FD (Fonts & LUTs)
+	m_vram_fe = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $FE (Text Matrix)
+	m_vram_ff = std::make_unique<uint8_t[]>(0x2000); // 8KB Block $FF (Color Matrix)
+	m_memtext_clut = std::make_unique<uint8_t[]>(0x2000); // 8KB MemText FG/BG CLUTs
 
 	m_timer0 = timer_alloc(FUNC(wildbits_jr2_state::timer0_tick), this);
 	m_timer1 = timer_alloc(FUNC(wildbits_jr2_state::timer1_tick), this);
@@ -4916,13 +5031,11 @@ void wildbits_jr2_state::machine_start()
 
 	save_pointer(NAME(m_ram), 0x200000);
 	save_pointer(NAME(m_cart), 0x40000);
-	save_pointer(NAME(m_vram_c0), 0x2000);
-	save_pointer(NAME(m_vram_c1), 0x2000);
-	save_pointer(NAME(m_vram_c2), 0x2000);
-	save_pointer(NAME(m_vram_c3), 0x2000);
-	save_pointer(NAME(m_vram_c4), 0x2000);
-	save_pointer(NAME(m_vram_c5), 0x2000);
-	save_pointer(NAME(m_vram_c6), 0x2000);
+	save_pointer(NAME(m_vram_fc), 0x2000);
+	save_pointer(NAME(m_vram_fd), 0x2000);
+	save_pointer(NAME(m_vram_fe), 0x2000);
+	save_pointer(NAME(m_vram_ff), 0x2000);
+	save_pointer(NAME(m_memtext_clut), 0x2000);
 	save_item(NAME(m_constant_ram));
 	save_item(NAME(m_vector_ram));
 	save_item(NAME(m_mlut));
@@ -5012,7 +5125,11 @@ void wildbits_jr2_state::machine_start()
 	save_item(NAME(m_ld_done));
 	save_item(NAME(m_ld_fifo_count));
 	save_item(NAME(m_is_turbo));
+	save_item(NAME(m_ram_write_frac));
+	save_item(NAME(m_io_read_frac));
 	save_item(NAME(m_io_write_frac));
+	save_item(NAME(m_wizfi_baud_code));
+	save_item(NAME(m_wizfi_reset_reg));
 	save_item(NAME(m_last_mouse_x));
 	save_item(NAME(m_last_mouse_y));
 	save_item(NAME(m_last_mouse_btn));
@@ -5022,14 +5139,14 @@ void wildbits_jr2_state::machine_start()
 	save_item(NAME(m_lfsr_last_cycle));
 	save_item(NAME(m_sid_select));
 
-	// Hardware Line-Draw Accelerator taps on CPU address space for Page $C0 ($1080 - $10FF)
+	// Hardware Line-Draw Accelerator taps on CPU address space for Page $FC ($1080 - $10FF)
 	m_maincpu->space(AS_PROGRAM).install_read_tap(0x0000, 0xffff, "wbjr2_ld_r",
 		[this](offs_t offset, u8 &data, u8 mem_mask)
 		{
 			uint8_t slot = (offset >> 13) & 7;
 			uint8_t active_lut = m_mmu_mem_ctrl & 0x03;
 			uint8_t block = m_mlut[active_lut][slot];
-			if (block == 0xc0)
+			if (block == 0xfc)
 			{
 				uint16_t blk_off = offset & 0x1fff;
 				if (blk_off >= 0x1080 && blk_off <= 0x10ff)
@@ -5074,13 +5191,13 @@ void wildbits_jr2_state::machine_start()
 						uint8_t base = sub & ~7;
 						uint8_t reg = sub & 7;
 						if (reg == 1)
-							data = m_vram_c0[0x1000 + base + 3]; // Addy Low
+							data = m_vram_fc[0x1000 + base + 3]; // Addy Low
 						else if (reg == 2)
-							data = m_vram_c0[0x1000 + base + 2]; // Addy Mid
+							data = m_vram_fc[0x1000 + base + 2]; // Addy Mid
 						else if (reg == 3)
-							data = m_vram_c0[0x1000 + base + 1]; // Addy High
+							data = m_vram_fc[0x1000 + base + 1]; // Addy High
 						else
-							data = m_vram_c0[0x1000 + base + reg];
+							data = m_vram_fc[0x1000 + base + reg];
 					}
 					else
 					{
@@ -5089,14 +5206,13 @@ void wildbits_jr2_state::machine_start()
 				}
 				else if (blk_off >= 0x1100 && blk_off <= 0x11ff)
 				{
-					// TinyVicky Tilemap register readback returns constant $33 in RTL (TinyVicky_TL_Registers.v)
-					data = 0x33;
+					// Hardware TinyVicky Tilemap register block readback (TinyVicky_TL_Registers.v):
+					// Line 81: assign DataOut_Tile_MAP_o = Bus_A_i[7] ? TILE_DAT_REG[Bus_A_i[4:0]] : TILE_REG[Bus_A_i[5:0]];
+					if (!(blk_off & 0x80))
+						data = m_vram_fc[0x1100 + (blk_off & 0x3f)];
+					else
+						data = m_vram_fc[0x1180 + (blk_off & 0x1f)];
 				}
-			}
-			else if (block == 0xc4)
-			{
-				// Reading from Page $C4 returns open bus
-				data = 0xff;
 			}
 		});
 
@@ -5106,7 +5222,7 @@ void wildbits_jr2_state::machine_start()
 			uint8_t slot = (offset >> 13) & 7;
 			uint8_t active_lut = m_mmu_mem_ctrl & 0x03;
 			uint8_t block = m_mlut[active_lut][slot];
-			if (block == 0xc0)
+			if (block == 0xfc)
 			{
 				uint16_t blk_off = offset & 0x1fff;
 				if (blk_off >= 0x1080 && blk_off <= 0x10ff)
@@ -5158,43 +5274,11 @@ void wildbits_jr2_state::machine_start()
 					}
 				}
 			}
-			else if (block == 0xc4)
-			{
-				uint16_t blk_off = offset & 0x1fff;
-				if (blk_off <= 0x001f) // $0000 - $001F: Left SID
-				{
-					m_sid_l->write(blk_off & 0x1f, data);
-				}
-				else if (blk_off >= 0x0080 && blk_off <= 0x009f) // $0080 - $009F: Both SIDs
-				{
-					m_sid_l->write(blk_off & 0x1f, data);
-					m_sid_r->write(blk_off & 0x1f, data);
-				}
-				else if (blk_off >= 0x0100 && blk_off <= 0x011f) // $0100 - $011F: Right SID
-				{
-					m_sid_r->write(blk_off & 0x1f, data);
-				}
-				else if (blk_off >= 0x0180 && blk_off <= 0x0183) // $0180 - $0183: Yamaha OPL3
-				{
-					m_opl3->write(blk_off & 0x03, data);
-				}
-				else if (blk_off >= 0x0200 && blk_off <= 0x0207) // $0200 - $0207: Left PSG
-				{
-					m_psg_l->write(data);
-				}
-				else if (blk_off >= 0x0208 && blk_off <= 0x020f) // $0208 - $020F: Both PSGs
-				{
-					m_psg_l->write(data);
-					m_psg_r->write(data);
-				}
-				else if (blk_off >= 0x0210 && blk_off <= 0x0217) // $0210 - $0217: Right PSG
-				{
-					m_psg_r->write(data);
-				}
-			}
 		});
 
 	m_is_turbo = false;
+	m_ram_write_frac = 0;
+	m_io_read_frac = 0;
 	m_io_write_frac = 0;
 	for (int i = 0; i < 8; i++)
 		m_slot_w_ptr[i] = m_unmapped.get();
@@ -5206,14 +5290,16 @@ void wildbits_jr2_state::machine_reset()
 {
 	if (system_bios() == 2)
 	{
-		m_maincpu->set_unscaled_clock(XTAL(25'175'000)); // Stock 6.29 MHz
+		m_maincpu->set_unscaled_clock(4 * 16'666'667); // Stock 16.67 MHz mode
 		m_is_turbo = false;
 	}
 	else
 	{
-		m_maincpu->set_unscaled_clock(2 * XTAL(25'175'000)); // 12 MHz Turbo Mode (Adaptive Timing: 12.58 MHz fetch/read, 8.39 MHz write, 6.29 MHz I/O)
+		m_maincpu->set_unscaled_clock(4 * 20'000'000); // 20 MHz Turbo Mode (Adaptive MMU Scheduler)
 		m_is_turbo = true;
 	}
+	m_ram_write_frac = 0;
+	m_io_read_frac = 0;
 	m_io_write_frac = 0;
 	// Default power-on Boot-from-Flash LUT configuration:
 	// Slots 0..6 map to RAM blocks 0x00..0x06
@@ -5313,14 +5399,14 @@ void wildbits_jr2_state::machine_reset()
 	m_uart_scr = 0;
 	while (!m_uart_rx_fifo.empty()) m_uart_rx_fifo.pop();
 
-	// Initialize Video Master defaults: Text Mode enabled (640x480, 80x30)
+	// Initialize Video Master defaults: Text Mode enabled (640x480, 80x30), Border default Black
 	m_vky_mstr_ctrl_0 = 0x01; // TEXT enabled
 	m_vky_mstr_ctrl_1 = 0x04; // 60Hz mode, DBL_Y enabled (80x30 default), Font 0
 	m_vky_layer_ctrl_0 = 0x00;
 	m_vky_layer_ctrl_1 = 0x00;
 	m_vky_brdr_ctrl = 0x00;
-	m_vky_brdr_b = 0x80;
-	m_vky_brdr_g = 0x80;
+	m_vky_brdr_b = 0x00;
+	m_vky_brdr_g = 0x00;
 	m_vky_brdr_r = 0x00;
 	m_vky_brdr_w = 0;
 	m_vky_brdr_h = 0;
@@ -5343,6 +5429,7 @@ void wildbits_jr2_state::machine_reset()
 	m_mouse_bytes[1] = 0;
 	m_mouse_bytes[2] = 0;
 	m_sam2695_ctrl = 0x0c; // Tx_empty, Rx_empty
+	while (!m_sam2695_rx_fifo.empty()) m_sam2695_rx_fifo.pop();
 	m_codec_lo = 0;
 	m_codec_hi = 0;
 	reset_codec();
@@ -5376,33 +5463,27 @@ void wildbits_jr2_state::machine_reset()
 	m_ld_done = false;
 	m_ld_fifo_count = 0;
 
-	memset(m_vram_c0.get(), 0, 0x2000);
-	memset(m_vram_c1.get(), 0, 0x2000);
-	memset(m_vram_c2.get(), 0x20, 0x2000); // Space filled text matrix
-	memset(m_vram_c3.get(), 0x7a, 0x2000); // Yellow on Purple authentic NitrOS-9 color
-	memset(m_vram_c4.get(), 0, 0x2000);
-	memset(m_vram_c5.get(), 0, 0x2000);
-	memset(m_vram_c6.get(), 0, 0x2000);
+	memset(m_vram_fc.get(), 0, 0x2000);
+	memset(m_vram_fd.get(), 0, 0x2000);
+	memset(m_vram_fe.get(), 0x20, 0x2000); // Space filled text matrix
+	memset(m_vram_ff.get(), 0x7a, 0x2000); // Yellow on Purple authentic NitrOS-9 color
+	memset(m_memtext_clut.get(), 0, 0x2000);
 
-	// Load Authentic OS-9 Bannerfont into Block $C1 (Font Set 0: $0000-$07FF and Font Set 1: $0800-$0FFF)
-	memcpy(&m_vram_c1[0x0000], s_os9_bannerfont, 2048);
-	memcpy(&m_vram_c1[0x0800], s_os9_bannerfont, 2048);
+	// Load Authentic OS-9 Bannerfont into Block $FD (Font Set 0: $0000-$07FF and Font Set 1: $0800-$0FFF)
+	memcpy(&m_vram_fd[0x0000], s_os9_bannerfont, 2048);
+	memcpy(&m_vram_fd[0x0800], s_os9_bannerfont, 2048);
 
-	// Pre-load MemText Font BRAM in Block $C6 with authentic bannerfont
-	memcpy(&m_vram_c6[0x0000], s_os9_bannerfont, 2048);
-	memcpy(&m_vram_c6[0x0800], s_os9_bannerfont, 2048);
+	// Initialize Default Foreground and Background Text Palettes in Block $FC ($1700 and $1740)
+	memcpy(&m_vram_fc[0x1700], s_os9_palette, 64);
+	memcpy(&m_vram_fc[0x1740], s_os9_palette, 64);
 
-	// Initialize Default Foreground and Background Text Palettes in Block $C0 ($1700 and $1740)
-	memcpy(&m_vram_c0[0x1700], s_os9_palette, 64);
-	memcpy(&m_vram_c0[0x1740], s_os9_palette, 64);
-
-	// Initialize MemText default registers ($1200-$121F) in Block $C0
-	m_vram_c0[0x120c] = 0x0a; // Precharge
-	m_vram_c0[0x120d] = 0x20; // Cursor B
-	m_vram_c0[0x120e] = 0x00; // Cursor G
-	m_vram_c0[0x120f] = 0x20; // Cursor R
-	m_vram_c0[0x1216] = 0xff; // Cursor Graphics x8
-	m_vram_c0[0x1217] = 0xff; // Cursor Graphics x8
+	// Initialize MemText default registers ($1200-$121F) in Block $FC
+	m_vram_fc[0x120c] = 0x0a; // Precharge
+	m_vram_fc[0x120d] = 0x20; // Cursor B
+	m_vram_fc[0x120e] = 0x00; // Cursor G
+	m_vram_fc[0x120f] = 0x20; // Cursor R
+	m_vram_fc[0x1216] = 0xff; // Cursor Graphics x8
+	m_vram_fc[0x1217] = 0xff; // Cursor Graphics x8
 
 	update_banks();
 	vs_stop_smf();
@@ -5413,13 +5494,16 @@ void wildbits_jr2_state::device_stop()
 {
 	vs_stop_smf();
 	vs_stop_audio();
+	if (!m_vram_fe || !m_vram_fc || !m_vram_fd || !m_ram)
+		return;
+	printf("Frame count: %d\n", m_frame_count);
 	printf("\n=== VRAM TEXT MATRIX SNAPSHOT ===\n");
 	for (int r = 0; r < 30; r++)
 	{
 		char line[81];
 		for (int c = 0; c < 80; c++)
 		{
-			uint8_t ch = m_vram_c2[r * 80 + c];
+			uint8_t ch = m_vram_fe[r * 80 + c];
 			line[c] = (ch >= 32 && ch < 127) ? ch : (ch == 0x20 || ch == 0x00) ? ' ' : '#';
 		}
 		line[80] = 0;
@@ -5427,14 +5511,14 @@ void wildbits_jr2_state::device_stop()
 	}
 	printf("=================================\n");
 	uint16_t pc = m_maincpu->pc();
-	uint32_t bm0_addr = ((uint32_t)m_vram_c0[0x1001] << 16) | ((uint32_t)m_vram_c0[0x1002] << 8) | m_vram_c0[0x1003];
+	uint32_t bm0_addr = ((uint32_t)m_vram_fc[0x1001] << 16) | ((uint32_t)m_vram_fc[0x1002] << 8) | m_vram_fc[0x1003];
 	printf("MSTR_CTRL: [%02X, %02X] LAYER_CTRL: [%02X, %02X]\n", m_vky_mstr_ctrl_0, m_vky_mstr_ctrl_1, m_vky_layer_ctrl_0, m_vky_layer_ctrl_1);
-	printf("BM0: ctrl=%02X addr=%06X\n", m_vram_c0[0x1000], bm0_addr);
+	printf("BM0: ctrl=%02X addr=%06X\n", m_vram_fc[0x1000], bm0_addr);
 	printf("CLUT0[0..3]: RGB(%02X,%02X,%02X) RGB(%02X,%02X,%02X) RGB(%02X,%02X,%02X) RGB(%02X,%02X,%02X)\n",
-		m_vram_c1[0x1002], m_vram_c1[0x1001], m_vram_c1[0x1000],
-		m_vram_c1[0x1006], m_vram_c1[0x1005], m_vram_c1[0x1004],
-		m_vram_c1[0x100a], m_vram_c1[0x1009], m_vram_c1[0x1008],
-		m_vram_c1[0x100e], m_vram_c1[0x100d], m_vram_c1[0x100c]);
+		m_vram_fd[0x1002], m_vram_fd[0x1001], m_vram_fd[0x1000],
+		m_vram_fd[0x1006], m_vram_fd[0x1005], m_vram_fd[0x1004],
+		m_vram_fd[0x100a], m_vram_fd[0x1009], m_vram_fd[0x1008],
+		m_vram_fd[0x100e], m_vram_fd[0x100d], m_vram_fd[0x100c]);
 	printf("RAM[bm0_addr..+7]: %02X %02X %02X %02X %02X %02X %02X %02X\n",
 		m_ram[bm0_addr & 0x1fffff], m_ram[(bm0_addr+1) & 0x1fffff], m_ram[(bm0_addr+2) & 0x1fffff], m_ram[(bm0_addr+3) & 0x1fffff],
 		m_ram[(bm0_addr+4) & 0x1fffff], m_ram[(bm0_addr+5) & 0x1fffff], m_ram[(bm0_addr+6) & 0x1fffff], m_ram[(bm0_addr+7) & 0x1fffff]);
@@ -5463,8 +5547,8 @@ void wildbits_jr2_state::device_stop()
 
 void wildbits_jr2_state::wbjr2(machine_config &config)
 {
-	// 6809 CPU clocked at 6.29 MHz (25.175 MHz / 4)
-	MC6809(config, m_maincpu, XTAL(25'175'000));
+	// 6809 CPU clocked at 20 MHz in Turbo Mode (unscaled clock is 4x = 80 MHz)
+	MC6809(config, m_maincpu, 4 * 20'000'000);
 	m_maincpu->set_addrmap(AS_PROGRAM, &wildbits_jr2_state::wbjr2_mem);
 
 	// SPI SD Card Controller
@@ -5755,9 +5839,9 @@ static INPUT_PORTS_START( wbjr2 )
 	PORT_DIPSETTING(    0x00, "111 (All On)" )
 	PORT_DIPNAME( 0x0e, 0x0e, "Boot Mode" )
 	PORT_DIPSETTING(    0x0e, "Normal Boot" )
-	PORT_DIPNAME( 0x01, 0x01, "Turbo Stretch Mode (~1.4x)" )
-	PORT_DIPSETTING(    0x01, DEF_STR( Off ) )
-	PORT_DIPSETTING(    0x00, DEF_STR( On ) )
+	PORT_DIPNAME( 0x01, 0x00, "Turbo Mode (Active-low: 0=Turbo, 1=Stock)" )
+	PORT_DIPSETTING(    0x00, "Turbo Mode (20 MHz / LONGVIEW_MEMFAST)" )
+	PORT_DIPSETTING(    0x01, "Stock Mode (16.67 MHz)" )
 
 	PORT_START("MOUSEX")
 	PORT_BIT( 0xffff, 0x0000, IPT_MOUSE_X ) PORT_SENSITIVITY(100) PORT_KEYDELTA(0) PORT_PLAYER(1)
@@ -5773,8 +5857,8 @@ INPUT_PORTS_END
 
 ROM_START(wbjr2)
 	ROM_REGION(0x80000, "flash", ROMREGION_ERASEFF)
-	ROM_SYSTEM_BIOS(0, "turbo", "12 MHz Turbo Mode (Adaptive Scheduler)")
-	ROM_SYSTEM_BIOS(1, "stock", "Stock Clock (6.29 MHz)")
+	ROM_SYSTEM_BIOS(0, "turbo", "20 MHz Turbo Mode (Adaptive MMU Scheduler)")
+	ROM_SYSTEM_BIOS(1, "stock", "Stock 16.67 MHz Mode (Adaptive MMU Scheduler)")
 	ROM_DEFAULT_BIOS("turbo")
 	ROM_LOAD("f0.dsk", 0x70000, 0x0a000, NO_DUMP)
 	ROM_LOAD("booter", 0x7a000, 0x06000, NO_DUMP)
