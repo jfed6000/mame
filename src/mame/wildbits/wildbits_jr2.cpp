@@ -2822,7 +2822,7 @@ void wildbits_jr2_state::dma_execute()
 						uint32_t d_addr = (dst + i) & 0x1ffffe;
 						if (!mask_even)
 						{
-							uint8_t fb = m_dma_reg[2];
+							uint8_t fb = m_dma_reg[3]; // DMA_FILL_WORD_L (even / low byte)
 							if (has_logic_op)
 								dma_write_byte(d_addr, apply_op(fb, dma_read_byte(d_addr)));
 							else
@@ -2830,7 +2830,7 @@ void wildbits_jr2_state::dma_execute()
 						}
 						if (!mask_odd && (i + 1 < count))
 						{
-							uint8_t fb = m_dma_reg[3];
+							uint8_t fb = m_dma_reg[2]; // DMA_FILL_WORD_H (odd / high byte)
 							if (has_logic_op)
 								dma_write_byte(d_addr + 1, apply_op(fb, dma_read_byte(d_addr + 1)));
 							else
@@ -2937,7 +2937,7 @@ void wildbits_jr2_state::dma_execute()
 						uint32_t d_addr = (row_dst + x) & 0x1ffffe;
 						if (!mask_even)
 						{
-							uint8_t fb = m_dma_reg[2];
+							uint8_t fb = m_dma_reg[3]; // DMA_FILL_WORD_L (even / low byte)
 							if (has_logic_op)
 								dma_write_byte(d_addr, apply_op(fb, dma_read_byte(d_addr)));
 							else
@@ -2945,7 +2945,7 @@ void wildbits_jr2_state::dma_execute()
 						}
 						if (!mask_odd && (x + 1 < width))
 						{
-							uint8_t fb = m_dma_reg[3];
+							uint8_t fb = m_dma_reg[2]; // DMA_FILL_WORD_H (odd / high byte)
 							if (has_logic_op)
 								dma_write_byte(d_addr + 1, apply_op(fb, dma_read_byte(d_addr + 1)));
 							else
