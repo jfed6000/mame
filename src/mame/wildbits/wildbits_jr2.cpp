@@ -4848,9 +4848,8 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 				uint8_t tile_idx = m_ram[cell_addr + 0];
 				uint8_t tile_attr = m_ram[cell_addr + 1];
 
-				// In TinyVicky II, tile index 0 in the cell matrix denotes an empty/transparent cell
-				if (tile_idx == 0)
-					continue;
+				// Tile index 0 is an ordinary tile: the hardware draws it (seen on a K2, Longview core;
+				// a transparent cell is a tile whose pixels are 0).
 
 				int fine_x = fine_x_orig;
 				int fine_y = fine_y_orig;
