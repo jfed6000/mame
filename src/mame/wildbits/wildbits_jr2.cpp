@@ -279,10 +279,11 @@ private:
 	TIMER_CALLBACK_MEMBER(timer0_tick);
 	TIMER_CALLBACK_MEMBER(timer1_tick);
 
-	// PS/2 Keyboard & Mouse ($FE50 - $FE54)
+	// PS/2 Keyboard & Mouse ($FE50 - $FE5F)
 	uint8_t ps2_r(offs_t offset);
 	void ps2_w(offs_t offset, uint8_t data);
 	void queue_kbd_scancode(uint8_t scancode);
+	void queue_mouse_byte(uint8_t byte);
 
 	// 16550 UART ($FE60 - $FE67)
 	uint8_t uart_r(offs_t offset);
@@ -392,8 +393,13 @@ private:
 	uint8_t m_lfsr_ctrl;
 	uint64_t m_lfsr_last_cycle;
 
-	// Sound state ($FF91 - $FF99)
+	// Sound state ($FF91 - $FF9F)
 	uint8_t m_sid_select;
+	uint8_t m_pcm_stage_l;
+	uint8_t m_pcm_stage_r;
+	int16_t m_pcm_cur_l;
+	int16_t m_pcm_cur_r;
+	attotime m_pcm_ready_time;
 
 	// Interrupt Controller
 	uint8_t m_int_pending[4];
@@ -421,6 +427,15 @@ private:
 	uint8_t m_ps2_out;
 	std::queue<uint8_t> m_kbd_fifo;
 	std::queue<uint8_t> m_mouse_fifo;
+	bool m_ps2_k_err;
+	bool m_ps2_m_err;
+	uint8_t m_kbd_gbuf[8];
+	uint8_t m_kbd_gcnt;
+	bool m_kbd_e1_seq;
+	attotime m_kbd_last_byte_time;
+	uint8_t m_mouse_gbuf[3];
+	uint8_t m_mouse_gcnt;
+	attotime m_mouse_last_byte_time;
 
 	// 16550 UART state
 	uint8_t m_uart_dll;
@@ -604,6 +619,8 @@ uint8_t *wildbits_jr2_state::get_physical_block_ptr(uint8_t block_num)
 	//   $FD: FONT_BLK (dual font banks $0000-$0FFF, graphics CLUTs $1000-$1FFF)
 	//   $FE: TEXT_RAM_BLK (Text Character Matrix, 4,800 bytes)
 	//   $FF: COLOR_RAM_BLK (Text Color Matrix, 4,800 bytes)
+	// In RC25 VICKYDIS mode (m_mmu_io_ctrl bit 3), blocks $FC-$FF map to physical SRAM
+	// providing the full contiguous 2MB physical SRAM space ($000000-$1FFFFF).
 	if (block_num < 0xfc)
 	{
 		if (m_mmu_io_ctrl & 0x04)
@@ -620,6 +637,11 @@ uint8_t *wildbits_jr2_state::get_physical_block_ptr(uint8_t block_num)
 			else
 				return &m_ram[block_num * 0x2000];
 		}
+	}
+	else if (m_mmu_io_ctrl & 0x08)
+	{
+		// RC25 VICKYDIS mode: Blocks $FC-$FF map to physical SRAM
+		return &m_ram[block_num * 0x2000];
 	}
 	else if (block_num == 0xfc)
 	{
@@ -747,7 +769,8 @@ void wildbits_jr2_state::mmu_mem_ctrl_w(uint8_t data)
 uint8_t wildbits_jr2_state::mmu_io_ctrl_r()
 {
 	io_wait_read();
-	return (m_mmu_io_ctrl & 0x7f) | 0x80;
+	// MMU_CTRL_REG_FFA1: bits 7:6 permanently read 1 (VICKYDIS.OK & FLASHDIS.OK)
+	return (m_mmu_io_ctrl & 0x3f) | 0xc0;
 }
 
 void wildbits_jr2_state::mmu_io_ctrl_w(uint8_t data)
@@ -755,7 +778,8 @@ void wildbits_jr2_state::mmu_io_ctrl_w(uint8_t data)
 	io_wait_write();
 	uint8_t old = m_mmu_io_ctrl;
 	m_mmu_io_ctrl = data;
-	if ((old ^ data) & 0x04)
+	// Bit 2: FLASHDIS, Bit 3: VICKYDIS
+	if ((old ^ data) & 0x0c)
 	{
 		update_banks();
 	}
@@ -1251,11 +1275,137 @@ void wildbits_jr2_state::timer_w(offs_t offset, uint8_t data)
 	}
 }
 
-// PS/2 Controller ($FE50 - $FE54)
+// PS/2 Controller ($FE50 - $FE5F)
 void wildbits_jr2_state::queue_kbd_scancode(uint8_t scancode)
 {
-	m_kbd_fifo.push(scancode);
-	set_irq(0, 0x04); // INT_PS2_KBD (Bit 2 of Group 0)
+	attotime now = machine().time();
+	if (m_kbd_last_byte_time != attotime::zero && now - m_kbd_last_byte_time >= attotime::from_msec(20))
+	{
+		m_kbd_gcnt = 0;
+		m_kbd_e1_seq = false;
+	}
+	m_kbd_last_byte_time = now;
+
+	if (!(m_ps2_ctrl & 0x40)) // K_FRAME disabled: pass-through mode
+	{
+		if (m_kbd_fifo.size() >= 255)
+		{
+			m_ps2_k_err = true;
+		}
+		else
+		{
+			m_kbd_fifo.push(scancode);
+			set_irq(0, 0x04);
+		}
+		return;
+	}
+
+	// K_FRAME enabled: assemble Scan Code Set 2 sequences per F256_PS2_Framer
+	bool c_restart = false;
+	bool c_done = false;
+
+	if (m_kbd_e1_seq)
+	{
+		c_done = (m_kbd_gcnt == 7);
+	}
+	else if (scancode == 0xe1)
+	{
+		c_restart = true;
+	}
+	else if (scancode == 0xe0 || scancode == 0xf0)
+	{
+		c_done = (m_kbd_gcnt == 7);
+	}
+	else
+	{
+		c_done = true;
+	}
+
+	if (c_restart)
+	{
+		m_kbd_gcnt = 0;
+		m_kbd_e1_seq = true;
+	}
+
+	if (m_kbd_gcnt < 8)
+	{
+		m_kbd_gbuf[m_kbd_gcnt++] = scancode;
+	}
+
+	if (c_done)
+	{
+		if (m_kbd_fifo.size() + m_kbd_gcnt <= 255)
+		{
+			for (uint8_t i = 0; i < m_kbd_gcnt; i++)
+			{
+				m_kbd_fifo.push(m_kbd_gbuf[i]);
+			}
+			set_irq(0, 0x04);
+		}
+		else
+		{
+			m_ps2_k_err = true;
+		}
+		m_kbd_gcnt = 0;
+		m_kbd_e1_seq = false;
+	}
+}
+
+void wildbits_jr2_state::queue_mouse_byte(uint8_t byte)
+{
+	attotime now = machine().time();
+	if (m_mouse_last_byte_time != attotime::zero && now - m_mouse_last_byte_time >= attotime::from_msec(20))
+	{
+		m_mouse_gcnt = 0;
+	}
+	m_mouse_last_byte_time = now;
+
+	if (!(m_ps2_ctrl & 0x80)) // M_FRAME disabled: pass-through mode
+	{
+		if (m_mouse_fifo.size() >= 255)
+		{
+			m_ps2_m_err = true;
+		}
+		else
+		{
+			m_mouse_fifo.push(byte);
+			set_irq(0, 0x08);
+		}
+		return;
+	}
+
+	// M_FRAME enabled: assemble 3-byte packets with bit 3 set on byte 0
+	if (m_mouse_gcnt == 0)
+	{
+		if (byte & 0x08)
+		{
+			m_mouse_gbuf[0] = byte;
+			m_mouse_gcnt = 1;
+		}
+		// Discard if bit 3 is 0 (sync hunting)
+	}
+	else if (m_mouse_gcnt == 1)
+	{
+		m_mouse_gbuf[1] = byte;
+		m_mouse_gcnt = 2;
+	}
+	else if (m_mouse_gcnt == 2)
+	{
+		m_mouse_gbuf[2] = byte;
+		if (m_mouse_fifo.size() + 3 <= 255)
+		{
+			for (int i = 0; i < 3; i++)
+			{
+				m_mouse_fifo.push(m_mouse_gbuf[i]);
+			}
+			set_irq(0, 0x08);
+		}
+		else
+		{
+			m_ps2_m_err = true;
+		}
+		m_mouse_gcnt = 0;
+	}
 }
 
 uint8_t wildbits_jr2_state::ps2_r(offs_t offset)
@@ -1270,21 +1420,33 @@ uint8_t wildbits_jr2_state::ps2_r(offs_t offset)
 		{
 			uint8_t code = m_kbd_fifo.front();
 			m_kbd_fifo.pop();
+			if (m_kbd_fifo.empty())
+			{
+				m_int_pending[0] &= ~0x04;
+				check_irqs();
+			}
 			return code;
 		}
 		return 0;
-	case 0x03: // MS_IN
+	case 0x03: // MS_IN: Pop from FIFO
 		if (!m_mouse_fifo.empty())
 		{
 			uint8_t code = m_mouse_fifo.front();
 			m_mouse_fifo.pop();
+			if (m_mouse_fifo.empty())
+			{
+				m_int_pending[0] &= ~0x08;
+				check_irqs();
+			}
 			return code;
 		}
 		return 0;
-	case 0x04: { // PS2_STAT
+	case 0x04: { // PS2_STAT: K_AK, K_NK, M_AK, M_NK, M_ERR, K_ERR, MEMP, KEMP
 		uint8_t stat = 0;
 		if (m_kbd_fifo.empty()) stat |= 0x01;   // KEMP
 		if (m_mouse_fifo.empty()) stat |= 0x02; // MEMP
+		if (m_ps2_k_err) stat |= 0x04;          // K_ERR
+		if (m_ps2_m_err) stat |= 0x08;          // M_ERR
 		return stat;
 	}
 	default: return 0;
@@ -1294,19 +1456,28 @@ uint8_t wildbits_jr2_state::ps2_r(offs_t offset)
 void wildbits_jr2_state::ps2_w(offs_t offset, uint8_t data)
 {
 	io_wait_write();
+	// RC25: CPU_A_i[3:1] == 3'b000 -> only offsets 0 ($FE50) and 1 ($FE51) accept writes
+	if (offset >= 2)
+		return;
+
 	switch (offset)
 	{
 	case 0x00: // PS2_CTRL
 		m_ps2_ctrl = data;
-		if (data & 0x10) // KCLR: Clear keyboard FIFO and IRQ
+		if (data & 0x10) // KCLR: Clear keyboard FIFO, framer, sticky error, and IRQ
 		{
 			while (!m_kbd_fifo.empty()) m_kbd_fifo.pop();
+			m_kbd_gcnt = 0;
+			m_kbd_e1_seq = false;
+			m_ps2_k_err = false;
 			m_int_pending[0] &= ~0x04;
 			check_irqs();
 		}
-		if (data & 0x20) // MCLR: Clear mouse FIFO and IRQ
+		if (data & 0x20) // MCLR: Clear mouse FIFO, framer, sticky error, and IRQ
 		{
 			while (!m_mouse_fifo.empty()) m_mouse_fifo.pop();
+			m_mouse_gcnt = 0;
+			m_ps2_m_err = false;
 			m_int_pending[0] &= ~0x08;
 			check_irqs();
 		}
@@ -3016,13 +3187,29 @@ uint8_t wildbits_jr2_state::optkbd_r(offs_t offset)
 	return 0x55;
 }
 
-// Consolidated Fixed I/O Sound Registers ($FF91 - $FF99)
+// Consolidated Fixed I/O Sound Registers ($FF91 - $FF9F)
 uint8_t wildbits_jr2_state::sound_fixed_r(offs_t offset)
 {
 	io_wait_read();
-	if (offset == 7) // $FF98: SID selector
+	switch (offset)
+	{
+	case 7: // $FF98: SID selector
 		return m_sid_select & 0x7f;
-	return 0xff;
+	case 9: // $FF9A: PCM Left Staging High Byte
+		return m_pcm_stage_l;
+	case 10: // $FF9B: PCM Left Committed Low Byte
+		return (uint8_t)(m_pcm_cur_l & 0xff);
+	case 11: // $FF9C: PCM Right Staging High Byte
+		return m_pcm_stage_r;
+	case 12: // $FF9D: PCM Right Committed Low Byte
+		return (uint8_t)(m_pcm_cur_r & 0xff);
+	case 13: // $FF9E: PCM Status (Bit 0: Ready / !busy)
+		return (machine().time() >= m_pcm_ready_time) ? 0x01 : 0x00;
+	case 14: // $FF9F: PCM Spare
+		return 0x00;
+	default:
+		return 0xff;
+	}
 }
 
 void wildbits_jr2_state::sound_fixed_w(offs_t offset, uint8_t data)
@@ -3070,6 +3257,30 @@ void wildbits_jr2_state::sound_fixed_w(offs_t offset, uint8_t data)
 		}
 		break;
 	}
+	case 9: // $FF9A: PCM Left Staging High Byte
+		if (machine().time() >= m_pcm_ready_time)
+			m_pcm_stage_l = data;
+		break;
+	case 10: // $FF9B: PCM Left Commit Low Byte
+		if (machine().time() >= m_pcm_ready_time)
+		{
+			m_pcm_cur_l = (int16_t)(((uint16_t)m_pcm_stage_l << 8) | data);
+			m_pcm_ready_time = machine().time() + attotime::from_nsec(250);
+		}
+		break;
+	case 11: // $FF9C: PCM Right Staging High Byte
+		if (machine().time() >= m_pcm_ready_time)
+			m_pcm_stage_r = data;
+		break;
+	case 12: // $FF9D: PCM Right Commit Low Byte
+		if (machine().time() >= m_pcm_ready_time)
+		{
+			m_pcm_cur_r = (int16_t)(((uint16_t)m_pcm_stage_r << 8) | data);
+			m_pcm_ready_time = machine().time() + attotime::from_nsec(250);
+		}
+		break;
+	default:
+		break;
 	}
 }
 
@@ -3810,6 +4021,9 @@ void wildbits_jr2_state::vs_decode_audio()
 
 void wildbits_jr2_state::sound_stream_update(sound_stream &stream)
 {
+	float pcm_l = (float)m_pcm_cur_l / 32768.0f;
+	float pcm_r = (float)m_pcm_cur_r / 32768.0f;
+
 	if (m_vs_decoding_audio)
 	{
 		if (m_pcm_fifo_l.size() < 16384)
@@ -3822,6 +4036,8 @@ void wildbits_jr2_state::sound_stream_update(sound_stream &stream)
 
 		for (int s = 0; s < stream.samples(); s++)
 		{
+			float vs_l = 0.0f;
+			float vs_r = 0.0f;
 			if (!m_pcm_fifo_l.empty())
 			{
 				int16_t l = m_pcm_fifo_l.front();
@@ -3830,19 +4046,25 @@ void wildbits_jr2_state::sound_stream_update(sound_stream &stream)
 				if (!m_pcm_fifo_r.empty())
 					m_pcm_fifo_r.pop_front();
 
-				stream.put_clamp(0, s, (float)(l * vol_l / 32768.0));
-				stream.put_clamp(1, s, (float)(r * vol_r / 32768.0));
+				vs_l = (float)(l * vol_l / 32768.0);
+				vs_r = (float)(r * vol_r / 32768.0);
 				m_total_samples_played++;
 			}
-			else
-			{
-				stream.put(0, s, 0.0f);
-				stream.put(1, s, 0.0f);
-			}
+
+			stream.put_clamp(0, s, vs_l + pcm_l);
+			stream.put_clamp(1, s, vs_r + pcm_r);
 		}
 
 		if (m_current_hz > 0)
 			m_vs_sci[4] = (uint16_t)(m_total_samples_played / m_current_hz);
+	}
+	else if (m_pcm_cur_l != 0 || m_pcm_cur_r != 0)
+	{
+		for (int s = 0; s < stream.samples(); s++)
+		{
+			stream.put_clamp(0, s, pcm_l);
+			stream.put_clamp(1, s, pcm_r);
+		}
 	}
 	else
 	{
@@ -4097,8 +4319,8 @@ void wildbits_jr2_state::wbjr2_mem(address_map &map)
 	// $FE30-$FE3F: System Timers 0 & 1
 	map(0xfe30, 0xfe3f).rw(FUNC(wildbits_jr2_state::timer_r), FUNC(wildbits_jr2_state::timer_w));
 
-	// $FE50-$FE54: PS/2 Keyboard and Mouse
-	map(0xfe50, 0xfe54).rw(FUNC(wildbits_jr2_state::ps2_r), FUNC(wildbits_jr2_state::ps2_w));
+	// $FE50-$FE5F: PS/2 Keyboard and Mouse
+	map(0xfe50, 0xfe5f).rw(FUNC(wildbits_jr2_state::ps2_r), FUNC(wildbits_jr2_state::ps2_w));
 
 	// $FE60-$FE67: 16550 UART (Serial / DriveWire)
 	map(0xfe60, 0xfe67).rw(FUNC(wildbits_jr2_state::uart_r), FUNC(wildbits_jr2_state::uart_w));
@@ -4131,8 +4353,8 @@ void wildbits_jr2_state::wbjr2_mem(address_map &map)
 	// $FF90: Hardware Configuration DIP Switches
 	map(0xff90, 0xff90).r(FUNC(wildbits_jr2_state::dipsw_r));
 
-	// $FF91-$FF99: Consolidated Fixed I/O Sound Registers
-	map(0xff91, 0xff99).rw(FUNC(wildbits_jr2_state::sound_fixed_r), FUNC(wildbits_jr2_state::sound_fixed_w));
+	// $FF91-$FF9F: Consolidated Fixed I/O Sound Registers
+	map(0xff91, 0xff9f).rw(FUNC(wildbits_jr2_state::sound_fixed_r), FUNC(wildbits_jr2_state::sound_fixed_w));
 
 	// $FFA0-$FFA1: MMU Control registers
 	map(0xffa0, 0xffa0).rw(FUNC(wildbits_jr2_state::mmu_mem_ctrl_r), FUNC(wildbits_jr2_state::mmu_mem_ctrl_w));
@@ -5061,6 +5283,13 @@ void wildbits_jr2_state::machine_start()
 	save_item(NAME(m_t1_cmp_ctr));
 	save_item(NAME(m_ps2_ctrl));
 	save_item(NAME(m_ps2_out));
+	save_item(NAME(m_ps2_k_err));
+	save_item(NAME(m_ps2_m_err));
+	save_item(NAME(m_kbd_gbuf));
+	save_item(NAME(m_kbd_gcnt));
+	save_item(NAME(m_kbd_e1_seq));
+	save_item(NAME(m_mouse_gbuf));
+	save_item(NAME(m_mouse_gcnt));
 	save_item(NAME(m_sdc_stat));
 	save_item(NAME(m_sdc_data_in));
 	save_item(NAME(m_sdc_data_out));
@@ -5138,6 +5367,10 @@ void wildbits_jr2_state::machine_start()
 	save_item(NAME(m_lfsr_ctrl));
 	save_item(NAME(m_lfsr_last_cycle));
 	save_item(NAME(m_sid_select));
+	save_item(NAME(m_pcm_stage_l));
+	save_item(NAME(m_pcm_stage_r));
+	save_item(NAME(m_pcm_cur_l));
+	save_item(NAME(m_pcm_cur_r));
 
 	// Hardware Line-Draw Accelerator taps on CPU address space for Page $FC ($1080 - $10FF)
 	m_maincpu->space(AS_PROGRAM).install_read_tap(0x0000, 0xffff, "wbjr2_ld_r",
@@ -5146,7 +5379,7 @@ void wildbits_jr2_state::machine_start()
 			uint8_t slot = (offset >> 13) & 7;
 			uint8_t active_lut = m_mmu_mem_ctrl & 0x03;
 			uint8_t block = m_mlut[active_lut][slot];
-			if (block == 0xfc)
+			if (block == 0xfc && !(m_mmu_io_ctrl & 0x08))
 			{
 				uint16_t blk_off = offset & 0x1fff;
 				if (blk_off >= 0x1080 && blk_off <= 0x10ff)
@@ -5222,7 +5455,7 @@ void wildbits_jr2_state::machine_start()
 			uint8_t slot = (offset >> 13) & 7;
 			uint8_t active_lut = m_mmu_mem_ctrl & 0x03;
 			uint8_t block = m_mlut[active_lut][slot];
-			if (block == 0xfc)
+			if (block == 0xfc && !(m_mmu_io_ctrl & 0x08))
 			{
 				uint16_t blk_off = offset & 0x1fff;
 				if (blk_off >= 0x1080 && blk_off <= 0x10ff)
@@ -5324,6 +5557,11 @@ void wildbits_jr2_state::machine_reset()
 	m_lfsr_ctrl = 0;
 	m_lfsr_last_cycle = 0;
 	m_sid_select = 0;
+	m_pcm_stage_l = 0;
+	m_pcm_stage_r = 0;
+	m_pcm_cur_l = 0;
+	m_pcm_cur_r = 0;
+	m_pcm_ready_time = attotime::zero;
 
 	// Reset Math Coprocessor
 	m_math_mulu_a = 0;
@@ -5371,6 +5609,13 @@ void wildbits_jr2_state::machine_reset()
 	// Reset PS/2 Controller
 	m_ps2_ctrl = 0;
 	m_ps2_out = 0;
+	m_ps2_k_err = false;
+	m_ps2_m_err = false;
+	m_kbd_gcnt = 0;
+	m_kbd_e1_seq = false;
+	m_kbd_last_byte_time = attotime::zero;
+	m_mouse_gcnt = 0;
+	m_mouse_last_byte_time = attotime::zero;
 	while (!m_kbd_fifo.empty()) m_kbd_fifo.pop();
 	while (!m_mouse_fifo.empty()) m_mouse_fifo.pop();
 	for (int i = 0; i < 4; i++)
@@ -5732,10 +5977,9 @@ void wildbits_jr2_state::poll_mouse()
 			uint8_t b1 = uint8_t(dx & 0xff);
 			uint8_t b2 = uint8_t(dy & 0xff);
 
-			m_mouse_fifo.push(b0);
-			m_mouse_fifo.push(b1);
-			m_mouse_fifo.push(b2);
-			set_irq(0, 0x08); // INT_PS2_MOUSE (Bit 3 of Group 0)
+			queue_mouse_byte(b0);
+			queue_mouse_byte(b1);
+			queue_mouse_byte(b2);
 		}
 	}
 }
