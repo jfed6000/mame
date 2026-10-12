@@ -4968,9 +4968,11 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 	{
 		// Hardware layer compositing order per TinyVicky architecture:
 		// Layer 2 = background, Layer 1 = middle, Layer 0 = foreground
-		int l0_plane = m_vky_layer_ctrl_0 & 0x0f;        // Layer 0 (front)
-		int l1_plane = (m_vky_layer_ctrl_0 >> 4) & 0x0f; // Layer 1 (middle)
-		int l2_plane = m_vky_layer_ctrl_1 & 0x0f;        // Layer 2 (back)
+		// Each layer's source is 3 bits ({Slot_Type, Plane}); bits 3 and 7 are not decoded by the core,
+		// and NitrOS-9's grfdrv256 leaves them set, so masking with $0F hid the bitmap and sprite layers.
+		int l0_plane = m_vky_layer_ctrl_0 & 0x07;        // Layer 0 (front)
+		int l1_plane = (m_vky_layer_ctrl_0 >> 4) & 0x07; // Layer 1 (middle)
+		int l2_plane = m_vky_layer_ctrl_1 & 0x07;        // Layer 2 (back)
 
 		bool rendered[7] = { false };
 		auto try_render_layer = [&](int p) {
