@@ -15,6 +15,7 @@
 
 #include "cpu/m6809/m6809.h"
 #include "machine/spi_sdcard.h"
+#include "machine/6522via.h"
 #include "screen.h"
 #include "sound/ymopl.h"
 #include "sound/sn76496.h"
@@ -189,6 +190,7 @@ public:
 		, m_sid_l(*this, "sid_l")
 		, m_sid_r(*this, "sid_r")
 		, m_sdcard(*this, "sdcard")
+		, m_via(*this, "via0")
 		, m_screen(*this, "screen")
 		, m_flash(*this, "flash")
 		, m_bank_r(*this, "bank_r%u", 0U)
@@ -266,6 +268,11 @@ private:
 	// Real-Time Clock ($FE40 - $FE4F)
 	uint8_t rtc_r(offs_t offset);
 	void rtc_w(offs_t offset, uint8_t data);
+	void update_rtc_timer();
+	TIMER_CALLBACK_MEMBER(rtc_tick);
+
+	// VIA0 ($FEB0 - $FEBF)
+	void via_irq_w(int state);
 
 	// Interrupt Controller ($FE20 - $FE2F)
 	uint8_t intc_r(offs_t offset);
@@ -360,6 +367,7 @@ private:
 	required_device<mos6581_device> m_sid_l;
 	required_device<mos6581_device> m_sid_r;
 	required_device<spi_sdcard_device> m_sdcard;
+	required_device<via6522_device> m_via;
 	required_device<screen_device> m_screen;
 	required_region_ptr<uint8_t> m_flash;
 	memory_bank_array_creator<8> m_bank_r;
@@ -448,8 +456,12 @@ private:
 	std::queue<uint8_t> m_uart_rx_fifo;
 	osd_file::ptr m_uart_socket;
 
-	// RTC state
+	// RTC state ($FE40 - $FE4F: bq4802)
+	uint8_t m_rtc_rates;
+	uint8_t m_rtc_enable;
+	uint8_t m_rtc_flags;
 	uint8_t m_rtc_ctrl;
+	emu_timer *m_rtc_timer = nullptr;
 
 	// Audio CODEC state
 	uint8_t m_codec_lo;
@@ -939,6 +951,13 @@ uint8_t wildbits_jr2_state::rtc_r(offs_t offset)
 	case 0x08: return to_bcd(systime.local_time.weekday + 1);
 	case 0x09: return to_bcd(systime.local_time.month + 1);
 	case 0x0a: return to_bcd(systime.local_time.year % 100);
+	case 0x0b: return m_rtc_rates;
+	case 0x0c: return m_rtc_enable;
+	case 0x0d: {
+		uint8_t flags = m_rtc_flags;
+		m_rtc_flags = 0; // Read clears flags
+		return flags;
+	}
 	case 0x0e: return m_rtc_ctrl;
 	case 0x0f: return to_bcd(systime.local_time.year / 100);
 	default: return 0;
@@ -948,8 +967,59 @@ uint8_t wildbits_jr2_state::rtc_r(offs_t offset)
 void wildbits_jr2_state::rtc_w(offs_t offset, uint8_t data)
 {
 	io_wait_write();
-	if (offset == 0x0e)
+	switch (offset)
+	{
+	case 0x0b:
+		m_rtc_rates = data;
+		update_rtc_timer();
+		break;
+	case 0x0c:
+		m_rtc_enable = data;
+		update_rtc_timer();
+		break;
+	case 0x0e:
 		m_rtc_ctrl = data;
+		break;
+	default:
+		break;
+	}
+}
+
+void wildbits_jr2_state::update_rtc_timer()
+{
+	// Bit 2 of RTC_ENABLE is PIE (Periodic Interrupt Enable)
+	if ((m_rtc_enable & 0x04) != 0)
+	{
+		uint8_t rs = m_rtc_rates & 0x0f;
+		if (rs > 0)
+		{
+			// Rate 9 = 7.8125 ms = 128 Hz
+			// Frequency = 32768 / (1 << (rs - 1))
+			double hz = 32768.0 / (double)(1 << (rs - 1));
+			if (hz < 2.0) hz = 2.0;
+			if (hz > 8192.0) hz = 8192.0;
+			m_rtc_timer->adjust(attotime::from_hz(hz), 0, attotime::from_hz(hz));
+			return;
+		}
+	}
+	m_rtc_timer->adjust(attotime::never);
+}
+
+TIMER_CALLBACK_MEMBER(wildbits_jr2_state::rtc_tick)
+{
+	m_rtc_flags |= 0x40; // Periodic interrupt flag
+	set_irq(1, 0x10);    // INT_RTC (Group 1, bit 4)
+}
+
+void wildbits_jr2_state::via_irq_w(int state)
+{
+	if (state)
+		set_irq(1, 0x20); // INT_VIA0 (Group 1, bit 5)
+	else
+	{
+		m_int_pending[1] &= ~0x20;
+		check_irqs();
+	}
 }
 
 void wildbits_jr2_state::reset_codec()
@@ -1201,25 +1271,25 @@ uint8_t wildbits_jr2_state::timer_r(offs_t offset)
 		m_t0_stat = 0; // Read clears status
 		return stat;
 	}
-	case 0x01: return t0_current & 0xff;
-	case 0x02: return (t0_current >> 8) & 0xff;
-	case 0x03: return (t0_current >> 16) & 0xff;
+	case 0x01: return (t0_current >> 16) & 0xff; // High byte
+	case 0x02: return (t0_current >> 8) & 0xff;  // Mid byte
+	case 0x03: return t0_current & 0xff;         // Low byte
 	case 0x04: return m_t0_cmp_ctr;
-	case 0x05: return m_t0_cmp & 0xff;
-	case 0x06: return (m_t0_cmp >> 8) & 0xff;
-	case 0x07: return (m_t0_cmp >> 16) & 0xff;
+	case 0x05: return (m_t0_cmp >> 16) & 0xff;   // High byte
+	case 0x06: return (m_t0_cmp >> 8) & 0xff;    // Mid byte
+	case 0x07: return m_t0_cmp & 0xff;           // Low byte
 	case 0x08: {
 		uint8_t stat = m_t1_stat;
 		m_t1_stat = 0;
 		return stat;
 	}
-	case 0x09: return m_t1_val & 0xff;
-	case 0x0a: return (m_t1_val >> 8) & 0xff;
-	case 0x0b: return (m_t1_val >> 16) & 0xff;
+	case 0x09: return (m_t1_val >> 16) & 0xff;   // High byte
+	case 0x0a: return (m_t1_val >> 8) & 0xff;    // Mid byte
+	case 0x0b: return m_t1_val & 0xff;           // Low byte
 	case 0x0c: return m_t1_cmp_ctr;
-	case 0x0d: return m_t1_cmp & 0xff;
-	case 0x0e: return (m_t1_cmp >> 8) & 0xff;
-	case 0x0f: return (m_t1_cmp >> 16) & 0xff;
+	case 0x0d: return (m_t1_cmp >> 16) & 0xff;   // High byte
+	case 0x0e: return (m_t1_cmp >> 8) & 0xff;    // Mid byte
+	case 0x0f: return m_t1_cmp & 0xff;           // Low byte
 	default: return 0;
 	}
 }
@@ -1246,13 +1316,40 @@ void wildbits_jr2_state::timer_w(offs_t offset, uint8_t data)
 			m_timer0->adjust(attotime::never);
 		}
 		break;
-	case 0x01: m_t0_val = (m_t0_val & 0xffff00) | data; break;
+	case 0x01: m_t0_val = (m_t0_val & 0x00ffff) | (data << 16); break;
 	case 0x02: m_t0_val = (m_t0_val & 0xff00ff) | (data << 8); break;
-	case 0x03: m_t0_val = (m_t0_val & 0x00ffff) | (data << 16); break;
+	case 0x03: m_t0_val = (m_t0_val & 0xffff00) | data; break;
 	case 0x04: m_t0_cmp_ctr = data; break;
-	case 0x05: m_t0_cmp = (m_t0_cmp & 0xffff00) | data; break;
-	case 0x06: m_t0_cmp = (m_t0_cmp & 0xff00ff) | (data << 8); break;
-	case 0x07: m_t0_cmp = (m_t0_cmp & 0x00ffff) | (data << 16); break;
+	case 0x05:
+		m_t0_cmp = (m_t0_cmp & 0x00ffff) | (data << 16);
+		if ((m_t0_ctr & 0x01) && m_t0_cmp > 0)
+		{
+			attotime period = attotime::from_hz(25'175'000) * m_t0_cmp;
+			if (period < attotime::from_hz(1000))
+				period = attotime::from_hz(1000);
+			m_timer0->adjust(period);
+		}
+		break;
+	case 0x06:
+		m_t0_cmp = (m_t0_cmp & 0xff00ff) | (data << 8);
+		if ((m_t0_ctr & 0x01) && m_t0_cmp > 0)
+		{
+			attotime period = attotime::from_hz(25'175'000) * m_t0_cmp;
+			if (period < attotime::from_hz(1000))
+				period = attotime::from_hz(1000);
+			m_timer0->adjust(period);
+		}
+		break;
+	case 0x07:
+		m_t0_cmp = (m_t0_cmp & 0xffff00) | data;
+		if ((m_t0_ctr & 0x01) && m_t0_cmp > 0)
+		{
+			attotime period = attotime::from_hz(25'175'000) * m_t0_cmp;
+			if (period < attotime::from_hz(1000))
+				period = attotime::from_hz(1000);
+			m_timer0->adjust(period);
+		}
+		break;
 	case 0x08: // T1_CTR
 		m_t1_ctr = data;
 		if (data & 0x01)
@@ -1265,13 +1362,25 @@ void wildbits_jr2_state::timer_w(offs_t offset, uint8_t data)
 			m_timer1->adjust(attotime::never);
 		}
 		break;
-	case 0x09: m_t1_val = (m_t1_val & 0xffff00) | data; break;
+	case 0x09: m_t1_val = (m_t1_val & 0x00ffff) | (data << 16); break;
 	case 0x0a: m_t1_val = (m_t1_val & 0xff00ff) | (data << 8); break;
-	case 0x0b: m_t1_val = (m_t1_val & 0x00ffff) | (data << 16); break;
+	case 0x0b: m_t1_val = (m_t1_val & 0xffff00) | data; break;
 	case 0x0c: m_t1_cmp_ctr = data; break;
-	case 0x0d: m_t1_cmp = (m_t1_cmp & 0xffff00) | data; break;
-	case 0x0e: m_t1_cmp = (m_t1_cmp & 0xff00ff) | (data << 8); break;
-	case 0x0f: m_t1_cmp = (m_t1_cmp & 0x00ffff) | (data << 16); break;
+	case 0x0d:
+		m_t1_cmp = (m_t1_cmp & 0x00ffff) | (data << 16);
+		if ((m_t1_ctr & 0x01) && m_t1_cmp > 0)
+			m_timer1->adjust(attotime::from_hz(60) * m_t1_cmp);
+		break;
+	case 0x0e:
+		m_t1_cmp = (m_t1_cmp & 0xff00ff) | (data << 8);
+		if ((m_t1_ctr & 0x01) && m_t1_cmp > 0)
+			m_timer1->adjust(attotime::from_hz(60) * m_t1_cmp);
+		break;
+	case 0x0f:
+		m_t1_cmp = (m_t1_cmp & 0xffff00) | data;
+		if ((m_t1_ctr & 0x01) && m_t1_cmp > 0)
+			m_timer1->adjust(attotime::from_hz(60) * m_t1_cmp);
+		break;
 	}
 }
 
@@ -1704,7 +1813,6 @@ void wildbits_jr2_state::reset_wizfi()
 		m_wizfi_rx_fifo.pop();
 	m_wizfi_tx_buf.clear();
 	m_wizfi_baud_code = 0x0a; // Baud code 10 = 115,200
-	m_wizfi_reset_reg = 0x00;
 	m_wizfi_ctrl = 0;
 	m_wizfi_transparent = false;
 	m_wizfi_plus_count = 0;
@@ -2171,6 +2279,22 @@ void wildbits_jr2_state::process_wizfi_cmd(const std::string &cmd_raw)
 	{
 		push_wizfi_response("\r\n+MQTTDIS:OK\r\n\r\nOK\r\n");
 	}
+	else if (cmd_upper.rfind("AT+CIPSNTPCFG", 0) == 0)
+	{
+		push_wizfi_response("\r\nOK\r\n");
+	}
+	else if (cmd_upper.rfind("AT+CIPSNTPTIME", 0) == 0)
+	{
+		static const char *const days[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+		static const char *const months[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+		system_time systime;
+		machine().current_datetime(systime);
+		auto &t = systime.local_time;
+		std::string resp = util::string_format(
+			"\r\n+CIPSNTPTIME:%s %s %d %02d:%02d:%02d %d\r\n\r\nOK\r\n",
+			days[t.weekday % 7], months[t.month % 12], t.mday, t.hour, t.minute, t.second, t.year);
+		push_wizfi_response(resp);
+	}
 	else if (cmd_upper.rfind("AT+", 0) == 0)
 	{
 		push_wizfi_response("\r\nOK\r\n");
@@ -2238,6 +2362,7 @@ void wildbits_jr2_state::wizfi_w(offs_t offset, uint8_t data)
 		if (data & 0x01) // Bit 0: Chip reset
 		{
 			reset_wizfi();
+			m_wizfi_reset_reg = data & 0x07;
 			// Pin T14 coupling: Setting bit 0 of $FF21 simultaneously resets SAM2695
 			m_sam2695_ctrl = 0;
 			while (!m_sam2695_rx_fifo.empty())
@@ -4335,6 +4460,9 @@ void wildbits_jr2_state::wbjr2_mem(address_map &map)
 	// $FEA0-$FEA8: Hardware Mouse Cursor
 	map(0xfea0, 0xfea8).rw(FUNC(wildbits_jr2_state::mouse_r), FUNC(wildbits_jr2_state::mouse_w));
 
+	// $FEB0-$FEBF: WDC 65C22 VIA 0
+	map(0xfeb0, 0xfebf).m(m_via, FUNC(via6522_device::map));
+
 	// $FEC0-$FEDF: TinyVicky Direct Memory Access (DMA) Controller
 	map(0xfec0, 0xfedf).rw(FUNC(wildbits_jr2_state::dma_r), FUNC(wildbits_jr2_state::dma_w));
 
@@ -5226,6 +5354,7 @@ void wildbits_jr2_state::machine_start()
 
 	m_timer0 = timer_alloc(FUNC(wildbits_jr2_state::timer0_tick), this);
 	m_timer1 = timer_alloc(FUNC(wildbits_jr2_state::timer1_tick), this);
+	m_rtc_timer = timer_alloc(FUNC(wildbits_jr2_state::rtc_tick), this);
 	m_vs_midi_timer = timer_alloc(FUNC(wildbits_jr2_state::vs_midi_tick), this);
 	m_stream = stream_alloc(0, 2, 44100);
 
@@ -5606,6 +5735,13 @@ void wildbits_jr2_state::machine_reset()
 	m_t1_cmp_ctr = 0;
 	m_timer1->adjust(attotime::never);
 
+	// Reset RTC
+	m_rtc_rates = 0;
+	m_rtc_enable = 0;
+	m_rtc_flags = 0;
+	m_rtc_ctrl = 0;
+	m_rtc_timer->adjust(attotime::never);
+
 	// Reset PS/2 Controller
 	m_ps2_ctrl = 0;
 	m_ps2_out = 0;
@@ -5743,7 +5879,8 @@ void wildbits_jr2_state::device_stop()
 		return;
 	printf("Frame count: %d\n", m_frame_count);
 	printf("\n=== VRAM TEXT MATRIX SNAPSHOT ===\n");
-	for (int r = 0; r < 30; r++)
+	int max_rows = (m_vky_mstr_ctrl_1 & 0x04) ? 30 : 60;
+	for (int r = 0; r < max_rows; r++)
 	{
 		char line[81];
 		for (int c = 0; c < 80; c++)
@@ -5800,6 +5937,10 @@ void wildbits_jr2_state::wbjr2(machine_config &config)
 	SPI_SDCARD(config, m_sdcard);
 	m_sdcard->set_prefer_sdhc();
 	m_sdcard->spi_miso_callback().set(FUNC(wildbits_jr2_state::sdcard_miso_w));
+
+	// WDC 65C22 VIA 0
+	MOS6522(config, m_via, 20'000'000);
+	m_via->irq_handler().set(FUNC(wildbits_jr2_state::via_irq_w));
 
 	// Video Screen: 640x480 @ 60Hz
 	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);
