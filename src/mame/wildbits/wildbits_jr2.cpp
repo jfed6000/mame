@@ -3383,23 +3383,25 @@ void wildbits_jr2_state::sound_fixed_w(offs_t offset, uint8_t data)
 		break;
 	}
 	case 9: // $FF9A: PCM Left Staging High Byte
-		if (machine().time() >= m_pcm_ready_time)
-			m_pcm_stage_l = data;
+		m_pcm_stage_l = data;
 		break;
 	case 10: // $FF9B: PCM Left Commit Low Byte
 		if (machine().time() >= m_pcm_ready_time)
 		{
+			if (m_stream)
+				m_stream->update();
 			m_pcm_cur_l = (int16_t)(((uint16_t)m_pcm_stage_l << 8) | data);
 			m_pcm_ready_time = machine().time() + attotime::from_nsec(250);
 		}
 		break;
 	case 11: // $FF9C: PCM Right Staging High Byte
-		if (machine().time() >= m_pcm_ready_time)
-			m_pcm_stage_r = data;
+		m_pcm_stage_r = data;
 		break;
 	case 12: // $FF9D: PCM Right Commit Low Byte
 		if (machine().time() >= m_pcm_ready_time)
 		{
+			if (m_stream)
+				m_stream->update();
 			m_pcm_cur_r = (int16_t)(((uint16_t)m_pcm_stage_r << 8) | data);
 			m_pcm_ready_time = machine().time() + attotime::from_nsec(250);
 		}
@@ -4183,18 +4185,13 @@ void wildbits_jr2_state::sound_stream_update(sound_stream &stream)
 		if (m_current_hz > 0)
 			m_vs_sci[4] = (uint16_t)(m_total_samples_played / m_current_hz);
 	}
-	else if (m_pcm_cur_l != 0 || m_pcm_cur_r != 0)
+	else
 	{
 		for (int s = 0; s < stream.samples(); s++)
 		{
 			stream.put_clamp(0, s, pcm_l);
 			stream.put_clamp(1, s, pcm_r);
 		}
-	}
-	else
-	{
-		stream.fill(0, 0.0f);
-		stream.fill(1, 0.0f);
 	}
 }
 
