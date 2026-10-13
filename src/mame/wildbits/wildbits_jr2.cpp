@@ -509,7 +509,9 @@ private:
 	std::deque<int16_t> m_pcm_fifo_l;
 	std::deque<int16_t> m_pcm_fifo_r;
 	uint64_t m_total_samples_played = 0;
-	uint32_t m_current_hz = 44100;
+	uint32_t m_current_hz = 44100;           // the decoded audio's rate; the stream's stays fixed
+	double m_vs_phase = 0.0;                 // resampler: position between the two samples below
+	int16_t m_vs_prev_l = 0, m_vs_prev_r = 0, m_vs_next_l = 0, m_vs_next_r = 0;
 
 	enum audio_format_t
 	{
@@ -3926,10 +3928,10 @@ void wildbits_jr2_state::vs_stop_audio()
 	m_vs_sdi_buf.clear();
 	m_total_samples_played = 0;
 	m_current_hz = 44100;
+	m_vs_phase = 0.0;
+	m_vs_prev_l = m_vs_prev_r = m_vs_next_l = m_vs_next_r = 0;
 	m_vs_sci[8] = 0;
 	m_vs_sci[9] = 0;
-	if (m_stream)
-		m_stream->set_sample_rate(44100);
 }
 
 void wildbits_jr2_state::vs_decode_audio()
@@ -3998,12 +4000,8 @@ void wildbits_jr2_state::vs_decode_audio()
 			int samples = mp3dec_decode_frame(&m_mp3dec, m_vs_sdi_buf.data(), m_vs_sdi_buf.size(), pcm, &info);
 			if (samples > 0)
 			{
-				if (info.hz > 0 && (uint32_t)info.hz != m_current_hz)
-				{
+				if (info.hz > 0)
 					m_current_hz = info.hz;
-					if (m_stream)
-						m_stream->set_sample_rate(m_current_hz);
-				}
 				m_vs_sci[5] = (m_current_hz & 0xfffe) | ((info.channels > 1) ? 1 : 0);
 				m_vs_sci[9] = 0xffe0;
 				m_vs_sci[8] = (info.bitrate_kbps << 8);
@@ -4093,12 +4091,8 @@ void wildbits_jr2_state::vs_decode_audio()
 			{
 				m_wav_header_parsed = true;
 				m_wav_data_left = data_size;
-				if (m_wav_rate > 0 && m_wav_rate != m_current_hz)
-				{
+				if (m_wav_rate > 0)
 					m_current_hz = m_wav_rate;
-					if (m_stream)
-						m_stream->set_sample_rate(m_current_hz);
-				}
 				m_vs_sci[5] = (m_current_hz & 0xfffe) | ((m_wav_channels > 1) ? 1 : 0);
 				m_vs_sci[9] = 0x7665;
 				m_vs_sdi_buf.erase(m_vs_sdi_buf.begin(), m_vs_sdi_buf.begin() + data_start);
@@ -4161,25 +4155,36 @@ void wildbits_jr2_state::sound_stream_update(sound_stream &stream)
 		double vol_l = (atten_l >= 254) ? 0.0 : (std::pow(10.0, -0.025 * atten_l) * m_codec_vs_gain_l);
 		double vol_r = (atten_r >= 254) ? 0.0 : (std::pow(10.0, -0.025 * atten_r) * m_codec_vs_gain_r);
 
+		// The stream keeps the rate it was allocated with: the decoded audio, at m_current_hz, is
+		// resampled here (linear interpolation).  Calling set_sample_rate() for a stream's new rate
+		// instead corrupted the heap (any WAV rate but 44,100 crashed MAME shortly after).
+		const double step = double(m_current_hz) / double(stream.sample_rate());
 		for (int s = 0; s < stream.samples(); s++)
 		{
-			float vs_l = 0.0f;
-			float vs_r = 0.0f;
-			if (!m_pcm_fifo_l.empty())
+			m_vs_phase += step;
+			while (m_vs_phase >= 1.0)
 			{
-				int16_t l = m_pcm_fifo_l.front();
-				m_pcm_fifo_l.pop_front();
-				int16_t r = m_pcm_fifo_r.empty() ? l : m_pcm_fifo_r.front();
-				if (!m_pcm_fifo_r.empty())
-					m_pcm_fifo_r.pop_front();
-
-				vs_l = (float)(l * vol_l / 32768.0);
-				vs_r = (float)(r * vol_r / 32768.0);
-				m_total_samples_played++;
+				m_vs_phase -= 1.0;
+				m_vs_prev_l = m_vs_next_l;
+				m_vs_prev_r = m_vs_next_r;
+				if (!m_pcm_fifo_l.empty())
+				{
+					m_vs_next_l = m_pcm_fifo_l.front();
+					m_pcm_fifo_l.pop_front();
+					m_vs_next_r = m_pcm_fifo_r.empty() ? m_vs_next_l : m_pcm_fifo_r.front();
+					if (!m_pcm_fifo_r.empty())
+						m_pcm_fifo_r.pop_front();
+					m_total_samples_played++;
+				}
+				else
+				{
+					m_vs_next_l = m_vs_next_r = 0;     // starved: silence
+				}
 			}
-
-			stream.put_clamp(0, s, vs_l + pcm_l);
-			stream.put_clamp(1, s, vs_r + pcm_r);
+			const double l = m_vs_prev_l + (m_vs_next_l - m_vs_prev_l) * m_vs_phase;
+			const double r = m_vs_prev_r + (m_vs_next_r - m_vs_prev_r) * m_vs_phase;
+			stream.put_clamp(0, s, float(l * vol_l / 32768.0) + pcm_l);
+			stream.put_clamp(1, s, float(r * vol_r / 32768.0) + pcm_r);
 		}
 
 		if (m_current_hz > 0)
@@ -4848,9 +4853,8 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 				uint8_t tile_idx = m_ram[cell_addr + 0];
 				uint8_t tile_attr = m_ram[cell_addr + 1];
 
-				// In TinyVicky II, tile index 0 in the cell matrix denotes an empty/transparent cell
-				if (tile_idx == 0)
-					continue;
+				// Tile index 0 is an ordinary tile: the hardware draws it (seen on a K2, Longview core;
+				// a transparent cell is a tile whose pixels are 0).
 
 				int fine_x = fine_x_orig;
 				int fine_y = fine_y_orig;
@@ -4968,9 +4972,11 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 	{
 		// Hardware layer compositing order per TinyVicky architecture:
 		// Layer 2 = background, Layer 1 = middle, Layer 0 = foreground
-		int l0_plane = m_vky_layer_ctrl_0 & 0x0f;        // Layer 0 (front)
-		int l1_plane = (m_vky_layer_ctrl_0 >> 4) & 0x0f; // Layer 1 (middle)
-		int l2_plane = m_vky_layer_ctrl_1 & 0x0f;        // Layer 2 (back)
+		// Each layer's source is 3 bits ({Slot_Type, Plane}); bits 3 and 7 are not decoded by the core,
+		// and NitrOS-9's grfdrv256 leaves them set, so masking with $0F hid the bitmap and sprite layers.
+		int l0_plane = m_vky_layer_ctrl_0 & 0x07;        // Layer 0 (front)
+		int l1_plane = (m_vky_layer_ctrl_0 >> 4) & 0x07; // Layer 1 (middle)
+		int l2_plane = m_vky_layer_ctrl_1 & 0x07;        // Layer 2 (back)
 
 		bool rendered[7] = { false };
 		auto try_render_layer = [&](int p) {
