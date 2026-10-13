@@ -477,31 +477,34 @@ Unlike standard VGA, TinyVicky separates text foreground and background color lo
 * **Foreground CLUT:** Block `$FC` at offset `$1700` (`$1700 + fg_idx * 4`)
 * **Background CLUT:** Block `$FC` at offset `$1740` (`$1740 + bg_idx * 4`)
 * **Color Entry Format (4 bytes):** `[Blue, Green, Red, Alpha / Reserved]` (Big-Endian byte order in hardware: Byte 0 = Blue, Byte 1 = Green, Byte 2 = Red, Byte 3 = Alpha/0).
-* **Authentic NitrOS-9 Colors:**
-  * Foreground `Index 7` = **Yellow** (`B=$77, G=$DD, R=$DD`, RGB `#DDDD77`)
-  * Background `Index 10` (`0x0A`) = **Purple** (`B=$77, G=$77, R=$FF`, RGB `#FF7777`)
-  * Default Character Attribute Byte = `0x7A` (Yellow on Purple)
+* **Hardware Power-On & Reset State:**
+  * **Color RAM (`Block $FF`) & Character RAM (`Block $FE`):** Instantiated as Xilinx 7-series Block RAMs (`TEXT_MEM_BLK COLOR_BLOCK` and `TEXT_BLOCK`). As uninitialized BRAMs (`no_coe_file_loaded`), all 4,800 bytes power up to **`$00`** in FPGA configuration, and CPU reset does not alter RAM contents.
+  * **Initial Display:** With Color RAM at `$00`, all character cells reference Foreground Index 0 (Black) and Background Index 0 (Black). Because border registers (`$1005–$1007`) and background registers (`$100D–$100F`) also reset to `$000000` (Black), the screen powers up **completely black**.
+* **Palette Indices & Software Color Remapping:**
+  * In the hardware BRAM palette (`mif/Text_LUT_OS9_palette.coe`), **Color 4 is Purple** (`RGB #CC4CCC`), **Color 7 is Yellow** (`RGB #DDDD77`), and **Color 10 (`$A`) is Light Red / Salmon** (`RGB #FF7777`).
+  * NitrOS-9 Level 2 dynamically achieves its signature Yellow on Purple appearance during boot when `sysgo` forks [`scfg.asm`](file:///Users/richardlucente/development/git/nitros9-wildbits-jr2-rc24/level1/wildbits/cmds/scfg.asm#L1675-L1681), which explicitly reprograms Palette Slot `$0A` to Purple (`$4F, $00, $80`) via terminal escape sequences (`$1B $60 $0A $4F $00 $80 $FF` and `$1B $61 $0A $4F $00 $80 $FF`).
+  * In early MAME builds, Color RAM was artificially pre-loaded with `$7A` and Character RAM with ASCII spaces (`$20`), which inadvertently mapped the space background to un-reprogrammed Slot `$A` (Salmon), causing an initial "salmon blink". MAME now accurately reflects the FPGA by initializing both RAMs to `$00` on reset.
 
 #### 1. Complete Default OS-9 Color Lookup Table (64 Bytes)
 Pre-initialized directly into FPGA BRAM (`TEXT_CLR_LUT`, `mif/Text_LUT_OS9_palette.coe`):
 
-| Index | Hardware Bytes `[B, G, R, A]` | RGB 24-bit | Authentic Role in NitrOS-9 |
+| Index | Hardware Bytes `[B, G, R, A]` | RGB 24-bit | Authentic Role in TinyVicky Hardware / NitrOS-9 |
 | :---: | :---: | :---: | :--- |
-| **0** | `0x00, 0x00, 0x00, 0x00` | `#000000` | Black |
+| **0** | `0x00, 0x00, 0x00, 0x00` | `#000000` | Black (Default Power-on FG and BG) |
 | **1** | `0xFF, 0xFF, 0xFF, 0x00` | `#FFFFFF` | Bright White |
-| **2** | `0x00, 0x00, 0x88, 0x00` | `#880000` | Dark Blue |
+| **2** | `0x00, 0x00, 0x88, 0x00` | `#880000` | Medium Red (FEU boots with BG set to Red) |
 | **3** | `0xEE, 0xFF, 0xAA, 0x00` | `#AAFFEE` | Cyan / Aqua |
-| **4** | `0xCC, 0x4C, 0xCC, 0x00` | `#CC4CCC` | Medium Violet |
+| **4** | `0xCC, 0x4C, 0xCC, 0x00` | `#CC4CCC` | Purple / Magenta (Hardware Palette Purple) |
 | **5** | `0x55, 0xCC, 0x00, 0x00` | `#00CC55` | Green |
-| **6** | `0xAA, 0x00, 0x00, 0x00` | `#0000AA` | Blue |
-| **7** | `0x77, 0xDD, 0xDD, 0x00` | **`#DDDD77`** | **Default Foreground: Yellow** |
+| **6** | `0xAA, 0x00, 0x00, 0x00` | `#0000AA` | Dark Blue |
+| **7** | `0x77, 0xDD, 0xDD, 0x00` | **`#DDDD77`** | **Yellow (Default Text Foreground)** |
 | **8** | `0x55, 0x88, 0xDD, 0x00` | `#DD8855` | Orange |
 | **9** | `0x00, 0x44, 0x66, 0x00` | `#664400` | Brown |
-| **10** (`$A`)| `0x77, 0x77, 0xFF, 0x00` | **`#FF7777`** | **Default Background: Purple / Magenta** |
+| **10** (`$A`)| `0x77, 0x77, 0xFF, 0x00` | **`#FF7777`** | **Light Red / Salmon** (Reprogrammed to Purple `#4F0080` by NitrOS-9 `scfg`) |
 | **11** | `0x33, 0x33, 0x33, 0x00` | `#333333` | Dark Gray |
 | **12** | `0x77, 0x77, 0x77, 0x00` | `#777777` | Medium Gray |
 | **13** | `0x66, 0xFF, 0xAA, 0x00` | `#AAFF66` | Light Green |
-| **14** | `0xFF, 0x88, 0x00, 0x00` | `#0088FF` | Light Blue / Red-Orange |
+| **14** | `0xFF, 0x88, 0x00, 0x00` | `#0088FF` | Light Blue |
 | **15** | `0xBB, 0xBB, 0xBB, 0x00` | `#BBBBBB` | Light Gray |
 
 #### 2. Pre-Loaded OS-9 Bannerfont Architecture (4,096 Bytes)
@@ -2247,7 +2250,8 @@ Traced from `nitros9project/nitros9` and parity release disk inspection:
 * **Hardware Truth:** Starting in `v8_rc10`, the FPGA BRAMs are pre-initialized with the official OS-9 Bannerfont and palette:
   * **Bannerfont:** 2,048 bytes (256 characters × 8 rows) pre-loaded in both Font Sets 0 & 1 in `FONT_CPU_Memory` (4,096 bytes). Extracted directly as [`bannerfont.bin`](file:///Users/richardlucente/tmp/parity_wildbits_jr2_v8_rc12/bannerfont.bin) and [`bannerfont.h`](file:///Users/richardlucente/tmp/parity_wildbits_jr2_v8_rc12/bannerfont.h).
   * **Default Palette:** 64 bytes (16 colors × 4 bytes `[Blue, Green, Red, Alpha]`) pre-loaded in `TEXT_CLR_LUT`. Extracted directly as [`os9_palette.bin`](file:///Users/richardlucente/tmp/parity_wildbits_jr2_v8_rc12/os9_palette.bin) and [`os9_palette.h`](file:///Users/richardlucente/tmp/parity_wildbits_jr2_v8_rc12/os9_palette.h).
-  * **Default Text Display:** Immediately at power-on, the text mode displays authentic NitrOS-9 Yellow (`#DDDD77`, Index 7) on Purple (`#FF7777`, Index 10) (`0x7A` attribute), eliminating the need for font/palette modules in bootfiles.
+  * **Text Character & Color RAM Power-On State:** In the FPGA RTL (`source/Jr2 Code/TinyVKY2_IO_Page0_Devices.v`), `TEXT_BLOCK` (Character RAM, Block `$FE`) and `COLOR_BLOCK` (Color RAM, Block `$FF`) are uninitialized Xilinx Block RAMs (`TEXT_MEM_BLK`). On power-on / bitstream load, they initialize to all zeros (`$00`). Because Color RAM holds `$00` (referencing Black Foreground Index 0 and Black Background Index 0) and border registers reset to `$000000`, the display powers on completely **Black**.
+  * **MAME Alignment & Elimination of Salmon Blink:** Prior MAME versions artificially initialized `m_vram_ff` to `$7A` and `m_vram_fe` to ASCII spaces (`$20`), attempting to mimic NitrOS-9's Yellow-on-Purple appearance. However, because Color 10 (`$A`) in the hardware palette is Salmon (`#FF7777`)—and Purple is Color 4 (`#CC4CCC`), with NitrOS-9 `scfg` only reprogramming Slot `$A` to Purple later during boot—the space background rendered as full-screen Salmon on frame 0. MAME [`src/mame/wildbits/wildbits_jr2.cpp`](file:///Users/richardlucente/development/git/mame/src/mame/wildbits/wildbits_jr2.cpp) now initializes `m_vram_fe`, `m_vram_ff`, and cursor registers to `$00`, faithfully matching the FPGA hardware and eliminating the salmon blink.
   * **Firmware Verification (`wildbits_jr2_6809_Longview_rc24.mcs`):** Binary comparison of `wildbits_jr2_6809_Longview_rc24.mcs` against earlier releases confirms that the BRAM coe preloads (`mif/Font_OS9_bannerfont.coe` and `mif/Text_LUT_OS9_palette.coe`) are **100% byte-identical (unchanged)**. Therefore, the embedded `s_os9_bannerfont` (2,048 bytes) and `s_os9_palette` (64 bytes) assets in MAME [`src/mame/wildbits/wildbits_jr2.cpp`](file:///Users/richardlucente/development/git/mame/src/mame/wildbits/wildbits_jr2.cpp) are completely up-to-date and require no changes.
 
 ### 9.8 Yamaha OPL3 FM Synthesizer Integration (Fixed I/O `$FF94–$FF97` Exclusively)
@@ -2486,7 +2490,7 @@ Traced from `nitros9project/nitros9` and parity release disk inspection:
 | **Network Interface** | **WizFi360 Wi-Fi only** (`$FF20–$FF2A`; no W5100S/W6100 Ethernet) | `IRQ_Controller_Jr.v` & `wizfi.asm` |
 | **DIP Switches (`$FF90`)** | **Onboard 8-position DIP switch** (Bit 0: Turbo mode enable [active-low: 0 = Turbo adaptive scheduler, 1 = Stock mode], Bit 7: Gamma) | `CFP95139AJR2_Top.v` & F256Jr2 Specs |
 | **OS-9 Bannerfont** | 2,048 B pre-loaded in BRAM Font Sets 0 & 1 (unchanged through Longview_rc25) | `bannerfont.bin` / `Font_OS9_bannerfont.coe` |
-| **OS-9 Text Palette** | 64 B pre-loaded in BRAM (`[B, G, R, A]`, Yellow on Purple, unchanged through Longview_rc25) | `os9_palette.bin` / `Text_LUT_OS9_palette.coe` |
+| **OS-9 Text Palette** | 64 B pre-loaded in BRAM (`[B, G, R, A]`, slot 0 Black, slot 4 Purple, slot 7 Yellow, slot 10/$A Salmon; unchanged through Longview_rc25) | `os9_palette.bin` / `Text_LUT_OS9_palette.coe` |
 
 ### 9.25 PS/2 Controller Hardening & F256_PS2_Framer Packet Framing Architecture (`$FE50 - $FE54`)
 * **Hardware Truth (`source/F256_Keyboard_And_Mouse.v`, `source/ps2_keyboard.v`, `source/ps2_mouse_modded.v`):**
@@ -2539,14 +2543,14 @@ Traced from `nitros9project/nitros9` and parity release disk inspection:
 | **16550 UART** | Serial registers `$FE60-$FE67`, BAUDCE 22.1184MHz clocking (divisor 5 = 230,400 baud), Host TCP bridge, DriveWire hardening (`wb/drivewire_stability`), **16750 Receive FIFO Pop Hardening (`uart_access = CS_UART_i & CPU_Data_Valid_i`, `uart_read_hold`)** | **Completed & Verified** | Host socket bridge (`127.0.0.1:65504`); `INT_UART` (Group 1 bit 0). Pop hardening guarantees falling CS edge per cycle and latches data prior to pop. |
 | **Interrupt Controller**| 4 Groups × 8 sources (`IRQ_Controller_Jr.v`), W1C latches, mask/polarity/edge (`NEW_Rx_FIFO_MIDI_Sync` on Group 3 bit 1) | **Completed & Verified** | All active Jr2 interrupt lines hooked up via `set_irq()` (Group 0 timers/video/PS2, Group 1 UART/RTC/VIA0, Group 3 WizFi/MIDI). |
 | **24-bit Timers** | Timer 0 (25.175 MHz dot clock) and Timer 1 (Frame) | **Completed & Verified** | Compares, values, status registers, Big-Endian byte order (`$01/$09` High, `$02/$0A` Mid, `$03/$0B` Low), and Group 0 IRQs verified. |
-| **TinyVicky Text Video**| 80x30 / 80x60, DBL_Y/X scaling, dual fonts in Page `$FD`, readable FG/BG CLUT shadows at `$1700` and `$1740` in Page `$FC`, Text RAM in Page `$FE`, Color RAM in Page `$FF` | **Completed & Verified** | Yellow on Purple authentic NitrOS-9 display; text buffers and registers in Longview Sectored I/O Pages `$FC–$FF`; dynamic row count snapshot in `device_stop()` based on `DBL_Y`. |
+| **TinyVicky Text Video**| 80x30 / 80x60, DBL_Y/X scaling, dual fonts in Page `$FD`, readable FG/BG CLUT shadows at `$1700` and `$1740` in Page `$FC`, Text RAM in Page `$FE`, Color RAM in Page `$FF` | **Completed & Verified** | Faithful FPGA power-on behavior (`$00` Text RAM / Color RAM renders clean black screen at reset, eliminating the former salmon blink); NitrOS-9 `scfg` remapping to Yellow on Purple; text buffers and registers in Longview Sectored I/O Pages `$FC–$FF`; dynamic row count snapshot in `device_stop()` based on `DBL_Y`. |
 | **Hardware Cursor** | TinyVicky cursor registers `$FFD0-$FFD7` in fixed I/O and Page `$FC` `$1014–$1017`, 30Hz blink | **Completed & Verified** | Inversion at cursor position verified. |
 | **PS/2 Keyboard & Mouse** | Host matrix to PS/2 Set 2 scan codes at `$FE50-$FE54`, relative mouse packet queue; **RC25 Hardening:** write filtering to `$FE50–$FE51` only, protocol validation (start=0, stop=1, odd parity), sticky error flags `PS2_STAT[3:2]`, and `F256_PS2_Framer` packet framing (`$FE50[7:6]`) with 20 ms gap timeout (`GAP_TIMEOUT=503500`) | **Completed & Verified (RC25)** | Interactive typing and relative mouse packet FIFO verified; cursor restoration verified (`wb/mouse_hide_unhide`). RC25 write filtering, sticky error flags, and packet framing with 20 ms timeout verified. |
 | **Real-Time Clock (RTC)** | bq4802 RTC registers at `$FE40-$FE4F` | **Completed & Verified** | Correctly mapped at `$FE40-$FE4F` with bq4802 BCD register layout, periodic timer allocation, and tick interrupt; verified NitrOS-9 `clock` driver date/time synchronization on boot. |
 | **Hardware DIP Switches** | Motherboard DIP switches at `$FF90` (Gamma, Turbo adaptive scheduler bit 0, boot modes) | **Completed & Verified** | Mapped at `$FF90` and connected to MAME `DIPSW` input ports and `-bios` CLI options (`-bios turbo`, `-bios stock`). |
 | **WizFi360 Wi-Fi** | Modern register layout `$FF20–$FF2A`, `HasReset` bit 7 flag at `$FF21`, 17 baud rates (codes 0..16), dual 2KB FIFOs, WizCon4 multi-socket engine, pin T14 coupling to SAM2695 reset, SNTP command emulation | **Completed & Verified** | AT engine, WizCon4 sockets, `INT_WIZFI_RX` (Group 3 bit 0), `INT_WIZFI_TX` (Group 3 bit 5), modern layout `$FF20–$FF2A`, SNTP `AT+CIPSNTPCFG` and `AT+CIPSNTPTIME` response formatting verified. |
 | **SAM2695 MIDI Synth** | Edition 3 register block at `$FF30–$FF39`: per-byte IRQ pulse of 127 CPU clocks (`MIDI_Rx_IRQn_o` to Group 3 bit 1), 31,250 baud bit timing (`First_Wait` 1152, 764 mid-bit clocks), pin T14 reset coupling to `$FF21` bit 0 | **Completed & Verified** | FIFO status flags, data port, software reset toggle, Edition 3 per-byte arrival interrupt, and coupled reset with `$FF21` bit 0 verified. |
-| **Built-in Font & Palette** | Embedded OS-9 Bannerfont and Palette in BRAM | **Completed & Verified** | Shows OS-9 font and palette from power-on. Confirmed 100% byte-identical through Longview_rc25. |
+| **Built-in Font & Palette** | Embedded OS-9 Bannerfont and Palette in BRAM | **Completed & Verified** | Embedded OS-9 font and palette verified in BRAM. Confirmed 100% byte-identical through Longview_rc25. Reset VRAM/Color RAM initialized to `$00` matching hardware. |
 | **Mouse Cursor Gating** | Pixel enable gated on `$FEA0` bit 0 | **Completed & Verified** | Eliminates orphaned cursor blocks on reset; unhides at exact previous coordinates without warping to right border (`wb/mouse_hide_unhide`). |
 | **Math Coprocessor** | Hardware 16x16 multiply, 16/16 divide with true 16-bit remainder at `$FEF6–$FEF7` (`MATH_DIV_REM`), 32-bit addition at `$FEE0-$FEFB` | **Completed & Verified** | Verified via NitrOS-9 `mathtest` suite with saturation & divide-by-zero guards. |
 | **Floating-Point Unit (FPU)** | Hardware IEEE-754 single-precision accelerator at `$FFE0–$FFEF` (`FP_Math_Module`): multiplier, divider, adder/subtractor, 20.12 bidirectional fixed-point conversion, RTL status flags | **Completed & Verified** | Verified via NitrOS-9 `fpu` test suite (all 9 checks passing). |

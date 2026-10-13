@@ -5799,8 +5799,8 @@ void wildbits_jr2_state::machine_reset()
 	m_vky_bg_g = 0x00;
 	m_vky_bg_r = 0x00;
 	m_vky_crsr_ctrl = 0x00;
-	m_vky_crsr_char = 0x20;
-	m_vky_crsr_color = 0x7a;
+	m_vky_crsr_char = 0x00;
+	m_vky_crsr_color = 0x00;
 	m_vky_crsr_x = 0;
 	m_vky_crsr_y = 0;
 
@@ -5849,8 +5849,8 @@ void wildbits_jr2_state::machine_reset()
 
 	memset(m_vram_fc.get(), 0, 0x2000);
 	memset(m_vram_fd.get(), 0, 0x2000);
-	memset(m_vram_fe.get(), 0x20, 0x2000); // Space filled text matrix
-	memset(m_vram_ff.get(), 0x7a, 0x2000); // Yellow on Purple authentic NitrOS-9 color
+	memset(m_vram_fe.get(), 0x00, 0x2000); // Uninitialized BRAM (0x00 on FPGA power-up/reset)
+	memset(m_vram_ff.get(), 0x00, 0x2000); // Uninitialized BRAM (0x00 on FPGA power-up/reset)
 	memset(m_memtext_clut.get(), 0, 0x2000);
 
 	// Load Authentic OS-9 Bannerfont into Block $FD (Font Set 0: $0000-$07FF and Font Set 1: $0800-$0FFF)
