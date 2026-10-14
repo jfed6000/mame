@@ -4825,6 +4825,14 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 		if (total_w_pix <= 0 || total_h_pix <= 0)
 			return;
 
+		// The tile engine fills its line buffer from 16 pixels before the visible area
+		// (TyVKY_TileMap_SM.v: VGE_EffectChannel_TL_ADDY starts at word 40, the read-out at
+		// pixel 96), and the first tile it writes there is one tile before the map's column.
+		// A 16x16 tile fills those 16 pixels exactly; an 8x8 one fills half, so 8x8 maps are
+		// drawn 8 pixels left of the bitmaps and sprites at zero scroll: map column 1 starts
+		// at screen x 0. Seen on a K2 (Longview core): 8x8 shifted by 8, 16x16 aligned.
+		int dx = (tile_size == 8) ? 8 : 0;
+
 		for (int by = 0; by < bm_h; by++)
 		{
 			int sy0 = by * 2;
@@ -4840,7 +4848,7 @@ uint32_t wildbits_jr2_state::screen_update(screen_device &screen, bitmap_rgb32 &
 
 			for (int bx = 0; bx < bm_w; bx++)
 			{
-				int virt_x = (bx + scroll_x) % total_w_pix;
+				int virt_x = (bx + scroll_x + dx) % total_w_pix;
 				if (virt_x < 0) virt_x += total_w_pix;
 
 				int tile_x = virt_x / tile_size;
